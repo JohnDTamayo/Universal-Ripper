@@ -1,0 +1,577 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DJ Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0d1117;
+            --card-bg: #161b22;
+            --text-primary: #c9d1d9;
+            --text-muted: #8b949e;
+            --accent: #58a6ff;
+            --accent-hover: #1f6feb;
+            --success: #3fb950;
+            --error: #f85149;
+            --warning: #d29922;
+        }
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            margin: 0;
+            padding: 0;
+            height: 100vh;
+            overflow: hidden;
+            display: flex;
+        }
+        .split-container {
+            display: flex;
+            width: 100vw;
+            height: 100vh;
+        }
+        .panel {
+            padding: 20px;
+            overflow-y: auto;
+            box-sizing: border-box;
+            -ms-overflow-style: none;  /* IE and Edge */
+            scrollbar-width: none;  /* Firefox */
+        }
+        .panel::-webkit-scrollbar {
+            display: none; /* Chrome, Safari and Opera */
+        }
+        #leftPanel { width: 50%; flex: none; }
+        #rightPanel { flex: 1; }
+        
+        .resizer {
+            width: 8px;
+            background-color: #30363d;
+            cursor: col-resize;
+            flex-shrink: 0;
+            transition: background-color 0.2s;
+            z-index: 10;
+        }
+        .resizer:hover, .resizer.resizing {
+            background-color: var(--accent);
+        }
+        body.resizing {
+            cursor: col-resize;
+            -webkit-user-select: none;
+            -moz-user-select: none;
+            -ms-user-select: none;
+            user-select: none;
+        }
+        body.resizing .panel {
+            pointer-events: none;
+        }
+        h1, h2 {
+            font-weight: 800;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            margin-top: 0;
+        }
+        .card {
+            background-color: var(--card-bg);
+            border-radius: 12px;
+            padding: 24px;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.2);
+            margin-bottom: 24px;
+        }
+        .search-bar {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 16px;
+        }
+        input {
+            flex: 1;
+            padding: 12px;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            background-color: var(--bg-color);
+            color: var(--text-primary);
+            font-size: 1em;
+            box-sizing: border-box;
+        }
+        input:focus {
+            outline: none;
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.3);
+        }
+        button {
+            padding: 12px 24px;
+            background-color: var(--accent);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 1em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        button:hover {
+            background-color: var(--accent-hover);
+        }
+        .search-bar input {
+            min-width: 0;
+        }
+        .search-bar button {
+            flex-shrink: 0;
+        }
+        .btn-rip {
+            background-color: var(--success);
+            padding: 8px 16px;
+            font-size: 0.9em;
+        }
+        .btn-rip:hover {
+            background-color: #2ea043;
+        }
+        .btn-secondary {
+            background-color: #30363d;
+            padding: 8px 12px;
+            font-size: 0.8em;
+        }
+        .btn-secondary:hover {
+            background-color: #444c56;
+        }
+        .btn-danger {
+            background-color: transparent;
+            color: var(--error);
+            border: 1px solid var(--error);
+            padding: 8px;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.2s;
+            width: 32px;
+            height: 32px;
+        }
+        .btn-danger:hover {
+            background-color: var(--error);
+            color: white;
+            transform: scale(1.1);
+        }
+        .btn-clear {
+            background-color: transparent;
+            color: var(--warning);
+            border: 1px solid var(--warning);
+            padding: 8px 12px;
+            font-size: 0.8em;
+            margin-right: 10px;
+        }
+        .btn-clear:hover {
+            background-color: var(--warning);
+            color: white;
+        }
+        .header-flex {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        .search-results {
+            margin-bottom: 20px;
+        }
+        .search-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px;
+            background-color: #1c2128;
+            border-radius: 6px;
+            margin-bottom: 8px;
+        }
+        .queue-table {
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: fixed;
+        }
+        .queue-table th, .queue-table td {
+            text-align: left;
+            padding: 12px;
+            border-bottom: 1px solid #30363d;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .queue-table th {
+            color: var(--text-muted);
+            font-size: 0.9em;
+            text-transform: uppercase;
+        }
+        .queue-table tr.status-skipped {
+            opacity: 0.5;
+            text-decoration: line-through;
+        }
+        /* Custom Checkbox */
+        .checkbox-container {
+            display: block;
+            position: relative;
+            padding-left: 35px;
+            margin-bottom: 24px;
+            cursor: pointer;
+            font-size: 22px;
+            user-select: none;
+        }
+        .checkbox-container input {
+            position: absolute;
+            opacity: 0;
+            cursor: pointer;
+            height: 0;
+            width: 0;
+        }
+        .checkmark {
+            position: absolute;
+            top: 0;
+            left: 0;
+            height: 25px;
+            width: 25px;
+            background-color: var(--bg-color);
+            border: 2px solid #30363d;
+            border-radius: 4px;
+        }
+        .checkbox-container:hover input ~ .checkmark {
+            background-color: #21262d;
+        }
+        .checkbox-container input:checked ~ .checkmark {
+            background-color: var(--success);
+            border-color: var(--success);
+        }
+        .checkmark:after {
+            content: "";
+            position: absolute;
+            display: none;
+        }
+        .checkbox-container input:checked ~ .checkmark:after {
+            display: block;
+        }
+        .checkbox-container .checkmark:after {
+            left: 8px;
+            top: 4px;
+            width: 5px;
+            height: 10px;
+            border: solid white;
+            border-width: 0 3px 3px 0;
+            transform: rotate(45deg);
+        }
+
+        /* Toast Notifications */
+        #toast-container {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            z-index: 1000;
+        }
+        .toast {
+            background-color: var(--card-bg);
+            color: var(--text-primary);
+            padding: 16px 24px;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            margin-top: 10px;
+            border-left: 4px solid var(--accent);
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            animation: slideIn 0.3s ease-out;
+            min-width: 250px;
+        }
+        .toast.success { border-left-color: var(--success); }
+        .toast.error { border-left-color: var(--error); }
+        .toast.info { border-left-color: var(--accent); }
+        
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+        @keyframes fadeOut {
+            from { opacity: 1; }
+            to { opacity: 0; }
+        }
+    </style>
+</head>
+<body>
+    <div class="split-container">
+        <div class="panel" id="leftPanel">
+            <div class="header-flex">
+                <h2>Universal Search</h2>
+                <button class="btn-secondary" onclick="openFolder('search')">Open Folder</button>
+            </div>
+            <form class="search-bar" id="searchForm">
+                <input type="text" id="searchQuery" placeholder="Search YouTube Music..." required>
+                <button type="submit">Search</button>
+            </form>
+            <div id="searchResults" class="search-results"></div>
+        </div>
+
+        <div class="resizer" id="dragMe"></div>
+
+        <div class="panel" id="rightPanel">
+            <div class="header-flex">
+                <h2>Guest Queue</h2>
+                <div>
+                    <button class="btn-clear" onclick="clearQueue()">Clear Queue</button>
+                    <button class="btn-secondary" onclick="openFolder('queue')">Open Folder</button>
+                </div>
+            </div>
+            <table class="queue-table">
+                <thead>
+                    <tr>
+                        <th width="50">Play</th>
+                        <th width="40%">Song</th>
+                        <th width="30%">Artist</th>
+                        <th>Status</th>
+                        <th width="80">Action</th>
+                    </tr>
+                </thead>
+                <tbody id="queueBody">
+                    <!-- Queue items will be loaded here -->
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div id="toast-container"></div>
+
+    <script>
+        // Set this to your Ngrok URL (e.g., 'https://random-id.ngrok-free.app')
+        // Leave it as an empty string if the backend is on the same domain
+        const API_BASE_URL = ''; 
+
+        // Universal Search
+        document.getElementById('searchForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const query = document.getElementById('searchQuery').value;
+            const resultsDiv = document.getElementById('searchResults');
+            resultsDiv.innerHTML = 'Searching...';
+
+            const formData = new FormData();
+            formData.append('query', query);
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/api/search`, {
+                    method: 'POST',
+                    body: formData
+                });
+                const results = await response.json();
+                
+                resultsDiv.innerHTML = '';
+                if (results.length === 0) {
+                    resultsDiv.innerHTML = 'No results found.';
+                    return;
+                }
+
+                results.forEach(result => {
+                    const div = document.createElement('div');
+                    div.className = 'search-item';
+                    const artist = result.artists ? result.artists.map(a => a.name).join(', ') : 'Unknown Artist';
+                    const type = result.album ? 'Official Release' : 'Video/Other';
+                    const duration = result.duration || '--:--';
+                    
+                    div.innerHTML = `
+                        <div>
+                            <strong>${result.title}</strong><br>
+                            <span style="font-size: 0.8em; color: var(--text-muted);">${artist} | ${type} | ${duration}</span>
+                        </div>
+                        <button class="btn-rip" onclick="ripSong('${result.title} ${artist}')">Rip</button>
+                    `;
+                    resultsDiv.appendChild(div);
+                });
+            } catch (error) {
+                console.error('Error searching:', error);
+                resultsDiv.innerHTML = 'Error searching.';
+            }
+        });
+
+        function showToast(message, type = 'success') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+            toast.innerHTML = `<span>${message}</span>`;
+            container.appendChild(toast);
+
+            setTimeout(() => {
+                toast.style.animation = 'fadeOut 0.5s ease-in forwards';
+                setTimeout(() => toast.remove(), 500);
+            }, 3000);
+        }
+
+        async function ripSong(query) {
+            const formData = new FormData();
+            formData.append('query', query);
+            try {
+                await fetch(`${API_BASE_URL}/api/download_direct`, {
+                    method: 'POST',
+                    body: formData
+                });
+                showToast(`Download started: ${query}`);
+            } catch (error) {
+                console.error('Error starting download:', error);
+                showToast('Failed to start download.', 'error');
+            }
+        }
+
+        async function openFolder(folderType) {
+            const formData = new FormData();
+            formData.append('folder_type', folderType);
+            try {
+                await fetch(`${API_BASE_URL}/api/open_folder`, {
+                    method: 'POST',
+                    body: formData
+                });
+            } catch (error) {
+                console.error('Error opening folder:', error);
+                showToast('Failed to open folder.', 'error');
+            }
+        }
+
+        // Queue Management
+        async function fetchQueue() {
+            try {
+                const response = await fetch(`${API_BASE_URL}/api/queue`);
+                const queue = await response.json();
+                
+                const tbody = document.getElementById('queueBody');
+                tbody.innerHTML = '';
+                
+                if (queue.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center; color: var(--text-muted);">No requests yet.</td></tr>';
+                    return;
+                }
+
+                queue.forEach(item => {
+                    const tr = document.createElement('tr');
+                    tr.className = `status-${item.status}`;
+                    
+                    const isChecked = item.status === 'selected' ? 'checked' : '';
+                    
+                    tr.innerHTML = `
+                        <td>
+                            <label class="checkbox-container">
+                                <input type="checkbox" ${isChecked} onchange="updateStatus(${item.id}, this.checked)">
+                                <span class="checkmark"></span>
+                            </label>
+                        </td>
+                        <td><strong>${item.song}</strong></td>
+                        <td>${item.artist}</td>
+                        <td style="color: var(--text-muted);">${item.status}</td>
+                        <td>
+                            <button class="btn-danger" onclick="deleteRequest(${item.id})" title="Delete Request">
+                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
+                                    <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
+                                    <path fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
+                                </svg>
+                            </button>
+                        </td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            } catch (error) {
+                console.error('Error fetching queue:', error);
+            }
+        }
+
+        async function updateStatus(id, isChecked) {
+            const status = isChecked ? 'selected' : 'skipped';
+            const formData = new FormData();
+            formData.append('id', id);
+            formData.append('status', status);
+
+            try {
+                await fetch(`${API_BASE_URL}/api/update_status`, {
+                    method: 'POST',
+                    body: formData
+                });
+                if (status === 'selected') {
+                    showToast('Song selected and download started.');
+                } else {
+                    showToast('Song skipped.', 'info');
+                }
+                fetchQueue(); // refresh
+            } catch (error) {
+                console.error('Error updating status:', error);
+                showToast('Failed to update status.', 'error');
+            }
+        }
+
+        async function deleteRequest(id) {
+            const formData = new FormData();
+            formData.append('id', id);
+
+            try {
+                await fetch(`${API_BASE_URL}/api/delete_request`, {
+                    method: 'POST',
+                    body: formData
+                });
+                showToast('Request deleted.', 'info');
+                fetchQueue();
+            } catch (error) {
+                console.error('Error deleting request:', error);
+                showToast('Failed to delete request.', 'error');
+            }
+        }
+
+        async function clearQueue() {
+            if (!confirm('Are you sure you want to clear the entire queue?')) {
+                return;
+            }
+
+            try {
+                await fetch(`${API_BASE_URL}/api/clear_queue`, {
+                    method: 'POST'
+                });
+                showToast('Queue cleared.');
+                fetchQueue();
+            } catch (error) {
+                console.error('Error clearing queue:', error);
+                showToast('Failed to clear queue.', 'error');
+            }
+        }
+
+        // Poll queue every 5 seconds
+        setInterval(fetchQueue, 5000);
+        fetchQueue();
+
+        // Resizer Logic
+        const resizer = document.getElementById('dragMe');
+        const leftPanel = document.getElementById('leftPanel');
+        
+        let x = 0;
+        let w = 0;
+
+        const mouseDownHandler = function(e) {
+            e.preventDefault();
+            x = e.clientX;
+            const rect = leftPanel.getBoundingClientRect();
+            w = rect.width;
+
+            document.addEventListener('mousemove', mouseMoveHandler);
+            document.addEventListener('mouseup', mouseUpHandler);
+            
+            resizer.classList.add('resizing');
+            document.body.classList.add('resizing');
+        };
+
+        const mouseMoveHandler = function(e) {
+            const dx = e.clientX - x;
+            const newWidth = ((w + dx) * 100) / resizer.parentNode.getBoundingClientRect().width;
+            
+            if (newWidth > 15 && newWidth < 85) {
+                leftPanel.style.width = `${newWidth}%`;
+            }
+        };
+
+        const mouseUpHandler = function() {
+            resizer.classList.remove('resizing');
+            document.body.classList.remove('resizing');
+            document.removeEventListener('mousemove', mouseMoveHandler);
+            document.removeEventListener('mouseup', mouseUpHandler);
+        };
+
+        resizer.addEventListener('mousedown', mouseDownHandler);
+    </script>
+</body>
+</html>
