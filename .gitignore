@@ -1,0 +1,36 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv/
+
+# Database
+queue.db
+
+# Media / Downloads
+DJ_Requests/
+
+# Environment Variables / Credentials
+.env
+.env.*
+secrets.json
+auth.json
+browser.json
+
+# IDEs
+.vscode/
+.idea/
+
+# OS specific files
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+
+# Logs
+*.log
