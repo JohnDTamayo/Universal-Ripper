@@ -535,9 +535,35 @@
             }
         }
 
-        // Poll queue every 5 seconds
-        setInterval(fetchQueue, 5000);
+        // Polling fallback (increased to 30s since we now have SSE)
+        setInterval(fetchQueue, 30000);
         fetchQueue();
+
+        // SSE Setup
+        function setupSSE() {
+            const eventSource = new EventSource(`${API_BASE_URL}/api/events`);
+            
+            eventSource.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                console.log("Received event:", data);
+                
+                if (data.event === "download_complete") {
+                    showToast(`Finished: ${data.query}`, 'success');
+                    // Refresh queue if it was a queue request
+                    fetchQueue();
+                } else if (data.event === "download_failed") {
+                    showToast(`Failed: ${data.query}`, 'error');
+                }
+            };
+            
+            eventSource.onerror = function(err) {
+                console.error("SSE connection lost. Reconnecting in 5s...");
+                eventSource.close();
+                setTimeout(setupSSE, 5000);
+            };
+        }
+
+        setupSSE();
 
         // Resizer Logic
         const resizer = document.getElementById('dragMe');
