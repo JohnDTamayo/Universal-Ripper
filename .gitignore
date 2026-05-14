@@ -34,3 +34,11 @@ Thumbs.db
 
 # Logs
 *.log
+
+
+#Tanner adding this stuff
+/scratch
+.envrc
+/DJ_Search_Rips
+/Guest_Queue_Rips
+
