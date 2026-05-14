@@ -370,14 +370,18 @@
                     const artist = result.artists ? result.artists.map(a => a.name).join(', ') : 'Unknown Artist';
                     const type = result.album ? 'Official Release' : 'Video/Other';
                     const duration = result.duration || '--:--';
+                    const query = `${result.title} ${artist}`;
                     
                     div.innerHTML = `
                         <div>
                             <strong>${result.title}</strong><br>
                             <span style="font-size: 0.8em; color: var(--text-muted);">${artist} | ${type} | ${duration}</span>
                         </div>
-                        <button class="btn-rip" onclick="ripSong('${result.title} ${artist}')">Rip</button>
+                        <button class="btn-rip">Rip</button>
                     `;
+                    
+                    // Use addEventListener instead of onclick to safely handle special characters
+                    div.querySelector('.btn-rip').addEventListener('click', () => ripSong(query));
                     resultsDiv.appendChild(div);
                 });
             } catch (error) {

@@ -71,8 +71,10 @@ def download_song(query: str, download_dir: str):
         
         os.makedirs(download_dir, exist_ok=True)
         try:
+            print(f"Starting download: {query}")
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
+            print(f"Successfully downloaded: {query}")
         except Exception as e:
             print(f"Error downloading {query}: {e}")
 
