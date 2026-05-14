@@ -23,7 +23,7 @@ fi
 
 # 2. Start the Backend
 echo "📡 Starting backend server..."
-$PYTHON_EXE app.py &
+"$PYTHON_EXE" app.py &
 BACKEND_PID=$!
 
 # 3. Start Ngrok
