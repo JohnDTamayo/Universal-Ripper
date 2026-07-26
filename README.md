@@ -39,16 +39,17 @@ This mode runs a local web server with a management dashboard for the DJ, and ge
    Provide the Ngrok tunnel URL (generated at startup) to your guests.
 
 ### 2. Standalone Desktop GUI (Search & Spotify Playlists)
-This mode runs a standalone native application where you can manually search for songs or paste Spotify playlists to batch-download them.
+This mode runs a standalone native desktop application where you can manually search for songs or paste Spotify playlists to batch-download them.
 
-1. **Install GUI Dependencies**:
-   ```bash
-   pip install -r requirements_gui.txt
-   ```
-2. **Run the App**:
-   ```bash
-   python ripper_gui.py
-   ```
+#### Initial Setup from Scratch (First-Time Users)
+Double-click the setup utility for your OS to create the Python virtual environment, install all dependencies, generate app icons, and create a Desktop shortcut named **"Ripped Ripper"**:
+- **macOS**: Double-click `./setup_mac.command`
+- **Windows**: Double-click `setup_win.bat`
+
+#### Quick Launch (Subsequent Runs)
+Once setup is complete, launch the desktop app anytime by double-clicking the **"Ripped Ripper"** shortcut on your Desktop, or using the quick launch utilities:
+- **macOS**: Double-click `./launch_gui.command` (or open `Ripped Ripper.app` on Desktop)
+- **Windows**: Double-click `launch_gui.bat` (or open `Ripped Ripper` shortcut on Desktop)
 
 ## Authors
 

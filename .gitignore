@@ -37,3 +37,5 @@ Thumbs.db
 DJ_Search_Rips/
 Playlist_Rips/
 Guest_Queue_Rips/
+scratch/
+.deps_installed

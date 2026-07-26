@@ -19,9 +19,9 @@ from pathlib import Path
 
 from PyQt6.QtCore import (
     QObject, QRunnable, QSize, QThread, QThreadPool,
-    Qt, pyqtSignal,
+    Qt, pyqtSignal, QUrl,
 )
-from PyQt6.QtGui import QColor, QFont, QPalette, QIcon
+from PyQt6.QtGui import QColor, QFont, QPalette, QIcon, QDesktopServices
 from PyQt6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QProgressBar, QPushButton, QScrollArea,
@@ -401,7 +401,9 @@ class PlaylistFetcher(QThread):
             def _hooked_from_missing(cls, **kwargs):
                 song = _original_from_missing(cls, **kwargs)
                 _track_counter[0] += 1
-                log(f"[Playlist] #{_track_counter[0]:>3d}  {song.artist} - {song.name}")
+                artists = getattr(song, 'artists', None) or []
+                artist_name = artists[0] if (artists and isinstance(artists[0], str)) else (getattr(song, 'artist', None) or "Unknown")
+                log(f"[Playlist] #{_track_counter[0]:>3d}  {artist_name} - {song.name}")
                 return song
 
             SpotdlSong.from_missing_data = _hooked_from_missing
@@ -790,7 +792,7 @@ class SearchTab(QWidget):
 
     def _open_folder(self) -> None:
         SEARCH_DIR.mkdir(parents=True, exist_ok=True)
-        os.system(f"open {str(SEARCH_DIR)!r}")
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(SEARCH_DIR)))
 
 
 class PlaylistTab(QWidget):
@@ -1009,7 +1011,7 @@ class PlaylistTab(QWidget):
             else PLAYLIST_DIR
         )
         folder.mkdir(parents=True, exist_ok=True)
-        os.system(f"open {str(folder)!r}")
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
 
 # ─── Main Window ──────────────────────────────────────────────────────────────
