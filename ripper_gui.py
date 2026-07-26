@@ -391,11 +391,31 @@ class PlaylistFetcher(QThread):
                 return
 
             log(f"[Playlist] spotdl found. Extracting tracks (this may take a moment)...")
-            client = Spotdl(
-                client_id=SPOTDL_CLIENT_ID,
-                client_secret=SPOTDL_CLIENT_SECRET,
-            )
-            songs = client.search([self.url])
+
+            # Hook into spotdl to log each track as it's parsed from the playlist
+            from spotdl.types.song import Song as SpotdlSong  # type: ignore
+            _original_from_missing = SpotdlSong.from_missing_data.__func__
+            _track_counter = [0]
+
+            @classmethod  # type: ignore
+            def _hooked_from_missing(cls, **kwargs):
+                song = _original_from_missing(cls, **kwargs)
+                _track_counter[0] += 1
+                log(f"[Playlist] #{_track_counter[0]:>3d}  {song.artist} - {song.name}")
+                return song
+
+            SpotdlSong.from_missing_data = _hooked_from_missing
+
+            try:
+                client = Spotdl(
+                    client_id=SPOTDL_CLIENT_ID,
+                    client_secret=SPOTDL_CLIENT_SECRET,
+                )
+                songs = client.search([self.url])
+            finally:
+                # Restore original method so repeated fetches don't stack hooks
+                SpotdlSong.from_missing_data = classmethod(_original_from_missing)
+
             log(f"[Playlist] Successfully extracted {len(songs)} tracks from playlist '{playlist_name}'.")
             self.tracks_ready.emit(playlist_name, songs)
 
