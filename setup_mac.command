@@ -62,20 +62,29 @@ fi
 touch venv/.deps_installed
 echo "✅ Dependencies successfully installed."
 
-# 5. Generate icon.icns & icon.ico from assets/icon.png using Pillow
+# 5. Generate icon.icns & icon.ico from assets/icon.png
 echo "🎨 Generating app icons..."
-python -c "
+ICON_PNG="$REPO_DIR/assets/icon.png"
+if [ -f "$ICON_PNG" ]; then
+    # icon.ico via Pillow
+    python -c "
 from PIL import Image
-import os
-icon_png = os.path.join('$REPO_DIR', 'assets', 'icon.png')
-if os.path.exists(icon_png):
-    img = Image.open(icon_png)
-    img.save(os.path.join('$REPO_DIR', 'assets', 'icon.ico'), format='ICO', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])
-    try:
-        img.save(os.path.join('$REPO_DIR', 'assets', 'icon.icns'), format='ICNS')
-    except Exception as e:
-        pass
+img = Image.open('$ICON_PNG')
+img.save('$REPO_DIR/assets/icon.ico', format='ICO', sizes=[(16,16),(32,32),(48,48),(64,64),(128,128),(256,256)])
 " 2>/dev/null || true
+
+    # icon.icns via macOS's native iconutil (Pillow's ICNS writer is unreliable)
+    ICONSET="$REPO_DIR/assets/icon.iconset"
+    rm -rf "$ICONSET"
+    mkdir -p "$ICONSET"
+    for size in 16 32 128 256 512; do
+        sips -z $size $size "$ICON_PNG" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null 2>&1
+        double=$((size * 2))
+        sips -z $double $double "$ICON_PNG" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null 2>&1
+    done
+    iconutil -c icns "$ICONSET" -o "$REPO_DIR/assets/icon.icns" 2>/dev/null || true
+    rm -rf "$ICONSET"
+fi
 
 # 6. Create macOS Application Bundle on Desktop ("Ripped Ripper.app")
 DESKTOP_APP="$HOME/Desktop/Ripped Ripper.app"
@@ -116,11 +125,22 @@ EOF
 cat <<EOF > "$DESKTOP_APP/Contents/MacOS/RippedRipper"
 #!/bin/bash
 cd "$REPO_DIR"
-source venv/bin/activate
-exec python ripper_gui.py
+# GUI apps launched via double-click don't inherit a login shell's PATH, so
+# Homebrew tools (ffmpeg, etc.) must be added explicitly.
+export PATH="/opt/homebrew/bin:/usr/local/bin:\$PATH"
+LOG_FILE="$REPO_DIR/ripper_gui_launch.log"
+{
+    source venv/bin/activate
+    exec python ripper_gui.py
+} >> "\$LOG_FILE" 2>&1
 EOF
 
 chmod +x "$DESKTOP_APP/Contents/MacOS/RippedRipper"
+
+# Ad-hoc code sign so macOS treats the app as a stable, identifiable bundle
+# (unsigned script-based .app bundles get silently denied Files & Folders access)
+codesign --force --deep -s - "$DESKTOP_APP" 2>/dev/null || true
+
 touch "$DESKTOP_APP"
 
 echo ""

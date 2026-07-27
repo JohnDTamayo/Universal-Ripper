@@ -10,6 +10,7 @@ A professional, automated music request and management system designed for live 
 - **Spotify Playlist Ripping**: Paste a Spotify playlist link in the Desktop GUI to automatically fetch and rip all tracks.
 - **Universal Search**: Real-time search across YouTube Music to find any requested track.
 - **Automated Ripping**: One-click downloading and conversion of songs to high-quality MP3s using `yt-dlp`.
+- **Custom Save Location**: Choose (or create) any folder on your machine as the download destination, right from the Desktop GUI.
 
 ## Tech Stack
 
@@ -20,6 +21,15 @@ A professional, automated music request and management system designed for live 
 - **Integrations**: `yt-dlp`, `ytmusicapi`, `spotdl`
 
 ## Getting Started
+
+### 0. Clone the Repo
+
+```bash
+git clone https://github.com/JohnDTamayo/Universal-Ripper.git ripped_ripper
+cd ripped_ripper
+```
+
+> **macOS users**: clone it somewhere *outside* `~/Desktop`, `~/Documents`, or `~/Downloads` (e.g. `~/Developer/ripped_ripper`). macOS silently blocks the Desktop app shortcut from reading files in those protected folders, which stops it from launching.
 
 There are two ways to use Ripped Ripper depending on your needs.
 

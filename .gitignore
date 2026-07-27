@@ -25,6 +25,8 @@ browser.json
 # IDEs
 .vscode/
 .idea/
+.claude/settings.local.json
+*.swp
 
 # OS specific files
 .DS_Store

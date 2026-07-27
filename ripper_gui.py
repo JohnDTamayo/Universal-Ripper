@@ -18,12 +18,12 @@ import urllib.request
 from pathlib import Path
 
 from PyQt6.QtCore import (
-    QObject, QRunnable, QSize, QThread, QThreadPool,
+    QObject, QRunnable, QSettings, QSize, QThread, QThreadPool,
     Qt, pyqtSignal, QUrl,
 )
 from PyQt6.QtGui import QColor, QFont, QPalette, QIcon, QDesktopServices
 from PyQt6.QtWidgets import (
-    QApplication, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QProgressBar, QPushButton, QScrollArea,
     QSizePolicy, QTabWidget, QVBoxLayout, QWidget, QCheckBox,
     QTextEdit, QSplitter
@@ -655,6 +655,55 @@ class TrackRow(QWidget):
         return self.checkbox.isChecked()
 
 
+class OutputFolderRow(QWidget):
+    """
+    'Save to: <path>  [Choose Folder…]' row.
+    The native folder picker lets the user create a new folder in place,
+    so this covers both "pick a location" and "make a new folder" in one dialog.
+    """
+
+    changed = pyqtSignal(Path)
+
+    def __init__(self, initial: Path, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._dir = initial
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        tag = QLabel("Save to:")
+        tag.setStyleSheet("color: #64748b; font-size: 12px; font-weight: 700; background: transparent;")
+
+        self._path_lbl = QLabel(str(self._dir))
+        self._path_lbl.setStyleSheet("color: #a78bfa; font-size: 12px; background: transparent;")
+        self._path_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        choose_btn = QPushButton("Choose Folder…")
+        choose_btn.setObjectName("ghost")
+        choose_btn.setFixedHeight(30)
+        choose_btn.clicked.connect(self._choose)
+
+        layout.addWidget(tag)
+        layout.addWidget(self._path_lbl, stretch=1)
+        layout.addWidget(choose_btn)
+
+    def _choose(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(
+            self,
+            "Choose (or create) a folder to save rips to",
+            str(self._dir),
+            QFileDialog.Option.ShowDirsOnly,
+        )
+        if chosen:
+            self._dir = Path(chosen)
+            self._path_lbl.setText(str(self._dir))
+            self.changed.emit(self._dir)
+
+    def path(self) -> Path:
+        return self._dir
+
+
 # ─── Tabs ─────────────────────────────────────────────────────────────────────
 
 class SearchTab(QWidget):
@@ -667,6 +716,9 @@ class SearchTab(QWidget):
         self._search_worker: SearchWorker | None = None
         # Keep signals alive (QRunnable doesn't retain them)
         self._signal_refs: list[WorkerSignals] = []
+
+        self._settings = QSettings("RippedRipper", "RipperGUI")
+        self._output_dir = Path(self._settings.value("search_output_dir", str(SEARCH_DIR)))
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 20)
@@ -687,6 +739,11 @@ class SearchTab(QWidget):
         row.addWidget(self._search_input, stretch=1)
         row.addWidget(self._search_btn)
         root.addLayout(row)
+
+        # ── Output folder row ───────────────────────────────────────────────
+        self._folder_row = OutputFolderRow(self._output_dir)
+        self._folder_row.changed.connect(self._on_output_dir_changed)
+        root.addWidget(self._folder_row)
 
         # ── Status ──────────────────────────────────────────────────────────
         self._status = QLabel("Search for any track to download a 320 kbps MP3")
@@ -709,13 +766,17 @@ class SearchTab(QWidget):
         root.addWidget(self._scroll, stretch=1)
 
         # ── Bottom button ───────────────────────────────────────────────────
-        open_btn = QPushButton("Open DJ_Search_Rips Folder")
+        open_btn = QPushButton("Open Folder")
         open_btn.setObjectName("ghost")
         open_btn.setFixedHeight(40)
         open_btn.clicked.connect(self._open_folder)
         root.addWidget(open_btn)
 
     # ── Private helpers ─────────────────────────────────────────────────────
+
+    def _on_output_dir_changed(self, new_dir: Path) -> None:
+        self._output_dir = new_dir
+        self._settings.setValue("search_output_dir", str(new_dir))
 
     def _do_search(self) -> None:
         query = self._search_input.text().strip()
@@ -745,7 +806,7 @@ class SearchTab(QWidget):
             return
 
         self._status.setText(
-            f"{len(results)} results found  ·  downloads -> DJ_Search_Rips/"
+            f"{len(results)} results found  ·  downloads -> {self._output_dir}/"
         )
         for result in results:
             vid = result.get("videoId")
@@ -782,7 +843,7 @@ class SearchTab(QWidget):
         sigs.skipped.connect(lambda tid:  self._update_card(tid, "skipped"))
         sigs.failed.connect(lambda tid, _: self._update_card(tid, "failed"))
 
-        worker = DownloadWorker(vid, title, artist, SEARCH_DIR, sigs)
+        worker = DownloadWorker(vid, title, artist, self._output_dir, sigs)
         self._pool.start(worker)
 
     def _update_card(self, track_id: str, status: str) -> None:
@@ -791,8 +852,8 @@ class SearchTab(QWidget):
             card.set_status(status)
 
     def _open_folder(self) -> None:
-        SEARCH_DIR.mkdir(parents=True, exist_ok=True)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(SEARCH_DIR)))
+        self._output_dir.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._output_dir)))
 
 
 class PlaylistTab(QWidget):
@@ -808,6 +869,9 @@ class PlaylistTab(QWidget):
         self._playlist_name = ""
         self._total         = 0
         self._completed     = 0
+
+        self._settings = QSettings("RippedRipper", "RipperGUI")
+        self._output_dir = Path(self._settings.value("playlist_output_dir", str(PLAYLIST_DIR)))
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 20)
@@ -830,6 +894,11 @@ class PlaylistTab(QWidget):
         row.addWidget(self._url_input, stretch=1)
         row.addWidget(self._fetch_btn)
         root.addLayout(row)
+
+        # ── Output folder row ───────────────────────────────────────────────
+        self._folder_row = OutputFolderRow(self._output_dir)
+        self._folder_row.changed.connect(self._on_output_dir_changed)
+        root.addWidget(self._folder_row)
 
         # ── Status ──────────────────────────────────────────────────────────
         self._status = QLabel("Paste a Spotify playlist link to fetch and batch-download all tracks")
@@ -882,6 +951,10 @@ class PlaylistTab(QWidget):
         bottom.addWidget(self._open_btn)
         root.addLayout(bottom)
 
+    def _on_output_dir_changed(self, new_dir: Path) -> None:
+        self._output_dir = new_dir
+        self._settings.setValue("playlist_output_dir", str(new_dir))
+
     # ── Fetch ────────────────────────────────────────────────────────────────
 
     def _fetch_playlist(self) -> None:
@@ -915,7 +988,7 @@ class PlaylistTab(QWidget):
 
         self._status.setText(
             f"{playlist_name}  ·  {len(songs)} tracks  "
-            f"->  Playlist_Rips/{sanitize(playlist_name)}/"
+            f"->  {self._output_dir}/{sanitize(playlist_name)}/"
         )
 
         for i, song in enumerate(songs):
@@ -966,7 +1039,7 @@ class PlaylistTab(QWidget):
         self._progress_bar.show()
         self._progress_lbl.setText(f"0 / {self._total}")
 
-        out_dir = PLAYLIST_DIR / sanitize(self._playlist_name or "Playlist")
+        out_dir = self._output_dir / sanitize(self._playlist_name or "Playlist")
         out_dir.mkdir(parents=True, exist_ok=True)
 
         for tid, row in selected:
@@ -1006,9 +1079,9 @@ class PlaylistTab(QWidget):
 
     def _open_folder(self) -> None:
         folder = (
-            PLAYLIST_DIR / sanitize(self._playlist_name)
+            self._output_dir / sanitize(self._playlist_name)
             if self._playlist_name
-            else PLAYLIST_DIR
+            else self._output_dir
         )
         folder.mkdir(parents=True, exist_ok=True)
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
