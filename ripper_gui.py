@@ -681,7 +681,7 @@ class OutputFolderRow(QWidget):
 
         choose_btn = QPushButton("Choose Folder…")
         choose_btn.setObjectName("ghost")
-        choose_btn.setFixedHeight(30)
+        choose_btn.setFixedHeight(38)
         choose_btn.clicked.connect(self._choose)
 
         layout.addWidget(tag)
