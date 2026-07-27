@@ -291,6 +291,20 @@
             from { opacity: 1; }
             to { opacity: 0; }
         }
+
+        /* Spinner */
+        .spinner {
+            width: 18px;
+            height: 18px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-top-color: #fff;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            flex-shrink: 0;
+        }
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
     </style>
 </head>
 <body>
@@ -370,14 +384,18 @@
                     const artist = result.artists ? result.artists.map(a => a.name).join(', ') : 'Unknown Artist';
                     const type = result.album ? 'Official Release' : 'Video/Other';
                     const duration = result.duration || '--:--';
+                    const query = `${result.title} ${artist}`;
                     
                     div.innerHTML = `
                         <div>
                             <strong>${result.title}</strong><br>
                             <span style="font-size: 0.8em; color: var(--text-muted);">${artist} | ${type} | ${duration}</span>
                         </div>
-                        <button class="btn-rip" onclick="ripSong('${result.title} ${artist}')">Rip</button>
+                        <button class="btn-rip">Rip</button>
                     `;
+                    
+                    // Use addEventListener instead of onclick to safely handle special characters
+                    div.querySelector('.btn-rip').addEventListener('click', () => ripSong(query));
                     resultsDiv.appendChild(div);
                 });
             } catch (error) {
@@ -386,31 +404,19 @@
             }
         });
 
-        function showToast(message, type = 'success') {
-            const container = document.getElementById('toast-container');
-            const toast = document.createElement('div');
-            toast.className = `toast ${type}`;
-            toast.innerHTML = `<span>${message}</span>`;
-            container.appendChild(toast);
-
-            setTimeout(() => {
-                toast.style.animation = 'fadeOut 0.5s ease-in forwards';
-                setTimeout(() => toast.remove(), 500);
-            }, 3000);
-        }
 
         async function ripSong(query) {
             const formData = new FormData();
             formData.append('query', query);
             try {
+                showToast(`Downloading: ${query}`, 'info', `query-${query}`);
                 await fetch(`${API_BASE_URL}/api/download_direct`, {
                     method: 'POST',
                     body: formData
                 });
-                showToast(`Download started: ${query}`);
             } catch (error) {
                 console.error('Error starting download:', error);
-                showToast('Failed to start download.', 'error');
+                showToast('Failed to start download.', 'error', `query-${query}`);
             }
         }
 
@@ -481,19 +487,28 @@
             formData.append('status', status);
 
             try {
+                if (status === 'selected') {
+                    // Find song title for the toast
+                    const checkbox = document.querySelector(`input[onchange*="${id}"]`);
+                    if (checkbox) {
+                        const row = checkbox.closest('tr');
+                        const songTitle = row.querySelector('td:nth-child(2)').innerText;
+                        showToast(`Downloading: ${songTitle}`, 'info', `req-${id}`);
+                    }
+                }
+
                 await fetch(`${API_BASE_URL}/api/update_status`, {
                     method: 'POST',
                     body: formData
                 });
-                if (status === 'selected') {
-                    showToast('Song selected and download started.');
-                } else {
+                
+                if (status !== 'selected') {
                     showToast('Song skipped.', 'info');
                 }
                 fetchQueue(); // refresh
             } catch (error) {
                 console.error('Error updating status:', error);
-                showToast('Failed to update status.', 'error');
+                showToast('Failed to update status.', 'error', `req-${id}`);
             }
         }
 
@@ -531,9 +546,107 @@
             }
         }
 
-        // Poll queue every 5 seconds
-        setInterval(fetchQueue, 5000);
+        // Polling fallback (increased to 30s since we now have SSE)
+        setInterval(fetchQueue, 30000);
         fetchQueue();
+
+        // SSE Setup
+        function setupSSE() {
+            const eventSource = new EventSource(`${API_BASE_URL}/api/events`);
+            
+            eventSource.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                console.log("Received event:", data);
+                
+                if (data.event === "download_complete") {
+                    const key = data.request_id ? `req-${data.request_id}` : `query-${data.query}`;
+                    updateToast(key, `Finished: ${data.query}`, 'success');
+                    // Refresh queue if it was a queue request
+                    fetchQueue();
+                } else if (data.event === "download_failed") {
+                    const key = data.request_id ? `req-${data.request_id}` : `query-${data.query}`;
+                    updateToast(key, `Failed: ${data.query}`, 'error');
+                }
+            };
+            
+            eventSource.onerror = function(err) {
+                console.error("SSE connection lost. Reconnecting in 5s...");
+                eventSource.close();
+                setTimeout(setupSSE, 5000);
+            };
+        }
+
+        setupSSE();
+
+        // New Toast System
+        const activeToasts = {};
+
+        function showToast(message, type = 'success', key = null) {
+            const container = document.getElementById('toast-container');
+            
+            // If it's a persistent toast and already exists, update it instead
+            if (key && activeToasts[key]) {
+                return updateToast(key, message, type);
+            }
+
+            const toast = document.createElement('div');
+            toast.className = `toast ${type}`;
+            
+            updateToastContent(toast, message, type);
+            container.appendChild(toast);
+
+            if (key) {
+                activeToasts[key] = toast;
+            }
+
+            // Only auto-dismiss if not 'info' (which we use for downloading)
+            if (type !== 'info') {
+                startDismissTimer(toast, key);
+            }
+            
+            return toast;
+        }
+
+        function updateToast(key, message, type) {
+            const toast = activeToasts[key];
+            if (!toast) {
+                // If key is provided but toast doesn't exist, create it as a normal toast
+                return showToast(message, type);
+            }
+
+            toast.className = `toast ${type}`;
+            updateToastContent(toast, message, type);
+            
+            // If it transitioned out of 'info', start the dismissal timer
+            if (type !== 'info') {
+                startDismissTimer(toast, key);
+            }
+            return toast;
+        }
+
+        function updateToastContent(toast, message, type) {
+            toast.innerHTML = '';
+            if (type === 'info') {
+                const spinner = document.createElement('div');
+                spinner.className = 'spinner';
+                toast.appendChild(spinner);
+            }
+            const span = document.createElement('span');
+            span.textContent = message;
+            toast.appendChild(span);
+        }
+
+        function startDismissTimer(toast, key) {
+            setTimeout(() => {
+                toast.style.animation = 'fadeOut 0.5s ease-in forwards';
+                setTimeout(() => {
+                    toast.remove();
+                    if (key && activeToasts[key] === toast) {
+                        delete activeToasts[key];
+                    }
+                }, 500);
+            }, 3000); // 3 seconds
+        }
 
         // Resizer Logic
         const resizer = document.getElementById('dragMe');

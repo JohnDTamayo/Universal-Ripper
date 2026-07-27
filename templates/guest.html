@@ -266,9 +266,32 @@
             }
         }
 
-        // Poll queue every 3 seconds
-        setInterval(fetchQueue, 3000);
+        // Polling fallback (increased to 30s since we now have SSE)
+        setInterval(fetchQueue, 30000);
         fetchQueue();
+
+        // SSE Setup
+        function setupSSE() {
+            const eventSource = new EventSource(`${API_BASE_URL}/api/events`);
+            
+            eventSource.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                console.log("Received event:", data);
+                
+                if (data.event === "download_complete") {
+                    // Refresh queue if it was a queue request
+                    fetchQueue();
+                }
+            };
+            
+            eventSource.onerror = function(err) {
+                console.error("SSE connection lost. Reconnecting in 5s...");
+                eventSource.close();
+                setTimeout(setupSSE, 5000);
+            };
+        }
+
+        setupSSE();
     </script>
 </body>
 </html>

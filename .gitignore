@@ -41,3 +41,4 @@ Playlist_Rips/
 Guest_Queue_Rips/
 scratch/
 .deps_installed
+.envrc
