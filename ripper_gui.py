@@ -4,7 +4,7 @@ Ripper GUI
 ──────────
 Standalone PyQt6 desktop app for:
   • Search & Rip  — search YouTube Music, download as 320kbps MP3
-  • Playlist Ripper — paste a Spotify playlist URL, download all tracks
+  • Playlist Ripper — paste a Spotify or Apple Music playlist URL, download all tracks
 
 Dependencies: PyQt6, ytmusicapi, yt-dlp, spotdl
 Run: python ripper_gui.py
@@ -15,6 +15,7 @@ import re
 import sys
 import json
 import urllib.request
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from PyQt6.QtCore import (
@@ -348,10 +349,21 @@ class DownloadWorker(QRunnable):
             self.signals.failed.emit(self.video_id, str(exc))
 
 
+@dataclass
+class SimpleSong:
+    """
+    Minimal stand-in for spotdl's Song type, used for Apple Music tracks.
+    PlaylistTrackDownloader and TrackRow only ever read `.name` and
+    `.artists`, so this is all that's needed to reuse that pipeline.
+    """
+    name: str
+    artists: list = field(default_factory=list)
+
+
 class PlaylistFetcher(QThread):
     """
-    Fetches a Spotify playlist's track list using spotdl (no API key needed).
-    Also resolves the human-readable playlist name via Spotify's public oembed.
+    Fetches a playlist's track list from Spotify (via spotdl) or Apple Music
+    (by parsing its public playlist page), depending on the URL.
     """
     tracks_ready   = pyqtSignal(str, list)   # (playlist_name, [Song, ...])
     status_update  = pyqtSignal(str)
@@ -363,73 +375,145 @@ class PlaylistFetcher(QThread):
 
     def run(self) -> None:
         try:
-            log(f"[Playlist] Fetching Spotify playlist info for: {self.url}...")
-            # ── 1. Resolve playlist name (no auth required) ──────────────────
-            playlist_name = "Spotify Playlist"
-            try:
-                req = urllib.request.Request(
-                    f"https://open.spotify.com/oembed?url={self.url}",
-                    headers={"User-Agent": "Mozilla/5.0"},
-                )
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    data = json.loads(resp.read())
-                    playlist_name = data.get("title", playlist_name)
-            except Exception:
-                pass  # name stays as default; non-fatal
-
-            self.status_update.emit(f'Fetching tracks for "{playlist_name}" …')
-
-            # ── 2. Fetch songs via spotdl ────────────────────────────────────
-            try:
-                from spotdl import Spotdl  # type: ignore
-            except ImportError:
-                log("[Playlist] Error: spotdl is not installed.")
+            if "music.apple.com" in self.url:
+                self._fetch_apple_music()
+            elif "spotify.com" in self.url:
+                self._fetch_spotify()
+            else:
                 self.error.emit(
-                    "spotdl is not installed.\n"
-                    "Run:  pip install spotdl   (or: pip install -r requirements_gui.txt)"
+                    "Please paste a Spotify or Apple Music playlist URL."
                 )
-                return
-
-            log(f"[Playlist] spotdl found. Extracting tracks (this may take a moment)...")
-
-            # Hook into spotdl to log each track as it's parsed from the playlist
-            from spotdl.types.song import Song as SpotdlSong  # type: ignore
-            _original_from_missing = SpotdlSong.from_missing_data.__func__
-            _track_counter = [0]
-
-            @classmethod  # type: ignore
-            def _hooked_from_missing(cls, **kwargs):
-                song = _original_from_missing(cls, **kwargs)
-                _track_counter[0] += 1
-                artists = getattr(song, 'artists', None) or []
-                artist_name = artists[0] if (artists and isinstance(artists[0], str)) else (getattr(song, 'artist', None) or "Unknown")
-                log(f"[Playlist] #{_track_counter[0]:>3d}  {artist_name} - {song.name}")
-                return song
-
-            SpotdlSong.from_missing_data = _hooked_from_missing
-
-            try:
-                client = Spotdl(
-                    client_id=SPOTDL_CLIENT_ID,
-                    client_secret=SPOTDL_CLIENT_SECRET,
-                )
-                songs = client.search([self.url])
-            finally:
-                # Restore original method so repeated fetches don't stack hooks
-                SpotdlSong.from_missing_data = classmethod(_original_from_missing)
-
-            log(f"[Playlist] Successfully extracted {len(songs)} tracks from playlist '{playlist_name}'.")
-            self.tracks_ready.emit(playlist_name, songs)
-
         except Exception as exc:
             log(f"[Playlist] Fatal Error during fetch: {exc}")
             self.error.emit(str(exc))
 
+    # ── Spotify ──────────────────────────────────────────────────────────────
+
+    def _fetch_spotify(self) -> None:
+        log(f"[Playlist] Fetching Spotify playlist info for: {self.url}...")
+        # ── 1. Resolve playlist name (no auth required) ──────────────────
+        playlist_name = "Spotify Playlist"
+        try:
+            req = urllib.request.Request(
+                f"https://open.spotify.com/oembed?url={self.url}",
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read())
+                playlist_name = data.get("title", playlist_name)
+        except Exception:
+            pass  # name stays as default; non-fatal
+
+        self.status_update.emit(f'Fetching tracks for "{playlist_name}" …')
+
+        # ── 2. Fetch songs via spotdl ────────────────────────────────────
+        try:
+            from spotdl import Spotdl  # type: ignore
+        except ImportError:
+            log("[Playlist] Error: spotdl is not installed.")
+            self.error.emit(
+                "spotdl is not installed.\n"
+                "Run:  pip install spotdl   (or: pip install -r requirements_gui.txt)"
+            )
+            return
+
+        log(f"[Playlist] spotdl found. Extracting tracks (this may take a moment)...")
+
+        # Hook into spotdl to log each track as it's parsed from the playlist
+        from spotdl.types.song import Song as SpotdlSong  # type: ignore
+        _original_from_missing = SpotdlSong.from_missing_data.__func__
+        _track_counter = [0]
+
+        @classmethod  # type: ignore
+        def _hooked_from_missing(cls, **kwargs):
+            song = _original_from_missing(cls, **kwargs)
+            _track_counter[0] += 1
+            artists = getattr(song, 'artists', None) or []
+            artist_name = artists[0] if (artists and isinstance(artists[0], str)) else (getattr(song, 'artist', None) or "Unknown")
+            log(f"[Playlist] #{_track_counter[0]:>3d}  {artist_name} - {song.name}")
+            return song
+
+        SpotdlSong.from_missing_data = _hooked_from_missing
+
+        try:
+            client = Spotdl(
+                client_id=SPOTDL_CLIENT_ID,
+                client_secret=SPOTDL_CLIENT_SECRET,
+            )
+            songs = client.search([self.url])
+        finally:
+            # Restore original method so repeated fetches don't stack hooks
+            SpotdlSong.from_missing_data = classmethod(_original_from_missing)
+
+        log(f"[Playlist] Successfully extracted {len(songs)} tracks from playlist '{playlist_name}'.")
+        self.tracks_ready.emit(playlist_name, songs)
+
+    # ── Apple Music ──────────────────────────────────────────────────────────
+
+    def _fetch_apple_music(self) -> None:
+        log(f"[Playlist] Fetching Apple Music playlist info for: {self.url}...")
+
+        req = urllib.request.Request(self.url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+
+        # Apple Music's web app embeds the fully-resolved page state (including
+        # the track list) as JSON in a server-rendered <script> tag — no API
+        # key or auth needed, same spirit as the Spotify oembed lookup above.
+        match = re.search(
+            r'<script type="application/json" id="serialized-server-data">(.*?)</script>',
+            html,
+            re.S,
+        )
+        if not match:
+            self.error.emit(
+                "Could not read this Apple Music playlist page "
+                "(the page format may have changed)."
+            )
+            return
+
+        try:
+            payload = json.loads(match.group(1))
+            sections = payload["data"][0]["data"]["sections"]
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            self.error.emit(f"Could not parse Apple Music playlist data: {exc}")
+            return
+
+        header = next(
+            (s for s in sections if s.get("itemKind") == "containerDetailHeaderLockup"),
+            None,
+        )
+        playlist_name = "Apple Music Playlist"
+        if header and header.get("items"):
+            playlist_name = header["items"][0].get("title", playlist_name)
+
+        track_section = next(
+            (s for s in sections if s.get("itemKind") == "trackLockup"), None
+        )
+        if not track_section or not track_section.get("items"):
+            self.error.emit("No tracks found on this Apple Music playlist page.")
+            return
+
+        self.status_update.emit(f'Fetching tracks for "{playlist_name}" …')
+
+        songs = []
+        for i, item in enumerate(track_section["items"], start=1):
+            title = item.get("title")
+            if not title:
+                continue
+            subtitle_links = item.get("subtitleLinks") or []
+            artist = subtitle_links[0]["title"] if subtitle_links else "Unknown Artist"
+            songs.append(SimpleSong(name=title, artists=[artist]))
+            log(f"[Playlist] #{i:>3d}  {artist} - {title}")
+
+        log(f"[Playlist] Successfully extracted {len(songs)} tracks from playlist '{playlist_name}'.")
+        self.tracks_ready.emit(playlist_name, songs)
+
 
 class PlaylistTrackDownloader(QRunnable):
     """
-    Downloads one Spotify-sourced track by matching it on YouTube Music
-    and ripping via yt-dlp — same pipeline as the search tab.
+    Downloads one playlist track (from Spotify or Apple Music) by matching
+    it on YouTube Music and ripping via yt-dlp — same pipeline as the search tab.
     """
 
     def __init__(
@@ -857,7 +941,7 @@ class SearchTab(QWidget):
 
 
 class PlaylistTab(QWidget):
-    """Tab 2 — paste a Spotify playlist URL, fetch tracks, download all."""
+    """Tab 2 — paste a Spotify or Apple Music playlist URL, fetch tracks, download all."""
 
     def __init__(self, pool: QThreadPool, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -881,7 +965,7 @@ class PlaylistTab(QWidget):
         row = QHBoxLayout()
         self._url_input = QLineEdit()
         self._url_input.setPlaceholderText(
-            "Paste Spotify playlist URL  (e.g. https://open.spotify.com/playlist/…)"
+            "Paste a Spotify or Apple Music playlist URL …"
         )
         self._url_input.setFixedHeight(48)
         self._url_input.returnPressed.connect(self._fetch_playlist)
@@ -901,7 +985,7 @@ class PlaylistTab(QWidget):
         root.addWidget(self._folder_row)
 
         # ── Status ──────────────────────────────────────────────────────────
-        self._status = QLabel("Paste a Spotify playlist link to fetch and batch-download all tracks")
+        self._status = QLabel("Paste a Spotify or Apple Music playlist link to fetch and batch-download all tracks")
         self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._status.setStyleSheet("color: #44446a; font-size: 13px;")
         root.addWidget(self._status)
@@ -959,14 +1043,14 @@ class PlaylistTab(QWidget):
 
     def _fetch_playlist(self) -> None:
         url = self._url_input.text().strip()
-        if not url or "spotify.com" not in url:
-            self._status.setText("Please enter a valid Spotify playlist URL.")
+        if not url or not any(d in url for d in ("spotify.com", "music.apple.com")):
+            self._status.setText("Please enter a valid Spotify or Apple Music playlist URL.")
             return
 
         self._fetch_btn.setEnabled(False)
         self._fetch_btn.setText("…")
         self._download_btn.setEnabled(False)
-        self._status.setText("Connecting to Spotify …")
+        self._status.setText("Connecting …")
         self._clear_tracks()
         self._progress_bar.hide()
         self._progress_lbl.setText("")
@@ -1116,7 +1200,7 @@ class MainWindow(QMainWindow):
             "color: #a78bfa; letter-spacing: -0.5px; background: transparent;"
         )
 
-        tag = QLabel("Search & Rip  ·  Spotify Playlists  ·  320 kbps MP3")
+        tag = QLabel("Search & Rip  ·  Spotify & Apple Music Playlists  ·  320 kbps MP3")
         tag.setStyleSheet("color: #64748b; font-size: 13px; font-weight: 600; background: transparent;")
         tag.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
