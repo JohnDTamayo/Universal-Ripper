@@ -183,9 +183,10 @@
     </div>
 
     <script>
-        // Set this to your Ngrok URL (e.g., 'https://random-id.ngrok-free.app')
-        // Leave it as an empty string if the backend is on the same domain
-        const API_BASE_URL = 'https://secluded-usual-trusting.ngrok-free.dev'; 
+        // Empty = same origin the page was served from, so requests follow the
+        // Ngrok tunnel automatically and never need editing when it changes.
+        // Only hardcode a URL here if the backend lives on a different domain.
+        const API_BASE_URL = '';
 
         document.getElementById('requestForm').addEventListener('submit', async (e) => {
             e.preventDefault();

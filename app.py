@@ -134,11 +134,14 @@ def download_song(query: str, download_dir: str, request_id: int = None):
 
 @app.get("/", response_class=HTMLResponse)
 async def guest_view(request: Request):
-    return templates.TemplateResponse(request=request, name="guest.html")
+    # Positional (name, context) form: spotdl pins fastapi<0.104, which pulls
+    # starlette 0.27 where the newer TemplateResponse(request=...) keyword form
+    # doesn't exist. This form works on both old and new Starlette.
+    return templates.TemplateResponse("guest.html", {"request": request})
 
 @app.get("/dj", response_class=HTMLResponse)
 async def dj_dashboard(request: Request):
-    return templates.TemplateResponse(request=request, name="dj.html")
+    return templates.TemplateResponse("dj.html", {"request": request})
 
 @app.post("/api/request")
 async def submit_request(artist: str = Form(...), song: str = Form(...)):
@@ -166,7 +169,7 @@ async def submit_request(artist: str = Form(...), song: str = Form(...)):
             if artists and isinstance(artists, list):
                 final_artist = artists[0].get('name', artist)
 
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, timeout=10)
     c = conn.cursor()
     c.execute("INSERT INTO requests (artist, song, status) VALUES (?, ?, 'pending')", (final_artist, final_song))
     conn.commit()

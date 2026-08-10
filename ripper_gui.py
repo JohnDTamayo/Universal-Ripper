@@ -3,30 +3,32 @@
 Ripper GUI
 ──────────
 Standalone PyQt6 desktop app for:
-  • Search & Rip  — search YouTube Music, download as 320kbps MP3
+  • Search & Rip  — search YouTube Music, download as MP3 / M4A / FLAC / WAV
   • Playlist Ripper — paste a Spotify or Apple Music playlist URL, download all tracks
 
 Dependencies: PyQt6, ytmusicapi, yt-dlp, spotdl
 Run: python ripper_gui.py
 """
 
-import os
 import re
 import sys
 import json
+import time
+import threading
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import (
-    QObject, QRunnable, QSettings, QSize, QThread, QThreadPool,
+    QObject, QRunnable, QSettings, QThread, QThreadPool,
     Qt, pyqtSignal, QUrl,
 )
-from PyQt6.QtGui import QColor, QFont, QPalette, QIcon, QDesktopServices
+from PyQt6.QtGui import QFont, QDesktopServices
 from PyQt6.QtWidgets import (
-    QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QProgressBar, QPushButton, QScrollArea,
-    QSizePolicy, QTabWidget, QVBoxLayout, QWidget, QCheckBox,
+    QTabWidget, QVBoxLayout, QWidget, QCheckBox,
     QTextEdit, QSplitter
 )
 
@@ -38,7 +40,57 @@ import yt_dlp
 BASE_DIR    = Path(__file__).parent
 SEARCH_DIR  = BASE_DIR / "DJ_Search_Rips"
 PLAYLIST_DIR = BASE_DIR / "Playlist_Rips"
-MAX_WORKERS = 4
+MAX_WORKERS = 8
+
+# ── Output formats ───────────────────────────────────────────────────────────
+# Everything format-specific lives here: the picker builds itself from this
+# table and build_ydl_opts derives its yt-dlp config from it, so adding a
+# format is a matter of adding a row.
+#
+# A note on quality: YouTube Music only serves lossy audio (~129kbps AAC/Opus),
+# and that is the ceiling. "m4a" copies that stream through untouched, so it is
+# the only option with no re-encode. wav/flac are lossless *containers* holding
+# the same lossy audio — they don't recover anything, they just take up more
+# room. mp3 re-encodes, costing a little quality for the widest compatibility.
+AUDIO_FORMATS: dict[str, dict] = {
+    "mp3": {
+        "label":    "MP3",
+        "hint":     "320 kbps · widest compatibility · ~9 MB/track",
+        "codec":    "mp3",
+        "quality":  "320",
+        "lossless": False,
+    },
+    "m4a": {
+        "label":    "M4A",
+        "hint":     "AAC copied as-is · fastest, no re-encode · ~4 MB/track",
+        "codec":    "m4a",
+        "quality":  "0",       # ignored; the AAC stream is copied as-is
+        "lossless": False,
+    },
+    "flac": {
+        "label":    "FLAC",
+        "hint":     "Lossless container · ~24 MB/track",
+        "codec":    "flac",
+        "quality":  "0",
+        "lossless": True,
+        # ffmpeg defaults to 24-bit here, which makes the FLAC *larger* than a
+        # 16-bit WAV for no gain — the source is a decoded lossy stream, so
+        # there's no extra depth to preserve.
+        "pp_args":  ["-sample_fmt", "s16"],
+    },
+    "wav": {
+        "label":    "WAV",
+        "hint":     "Lossless, no metadata support · ~44 MB/track",
+        "codec":    "wav",
+        "quality":  "0",
+        "lossless": True,
+    },
+}
+DEFAULT_AUDIO_FORMAT = "mp3"
+
+# Every format we recognise on disk, used to spot a track that's already been
+# ripped in some other format.
+KNOWN_AUDIO_EXTS = tuple(AUDIO_FORMATS)
 
 # spotdl's publicly bundled Spotify credentials (from their open-source repo)
 SPOTDL_CLIENT_ID     = "5f573c9620494bae87890c0f08a60293"
@@ -225,6 +277,43 @@ QCheckBox::indicator:disabled {
     border-color: #1e1e2f;
 }
 
+/* ── Combo box ── */
+QComboBox {
+    background-color: #1a1a2e;
+    border: 1px solid #2d2d44;
+    border-radius: 10px;
+    padding: 6px 12px;
+    color: #dde1f0;
+    font-size: 12px;
+    font-weight: 700;
+    min-width: 76px;
+}
+QComboBox:hover {
+    border-color: #8b5cf6;
+    background-color: #1e1e36;
+}
+QComboBox::drop-down {
+    border: none;
+    width: 22px;
+}
+QComboBox::down-arrow {
+    image: none;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #818cf8;
+    margin-right: 10px;
+}
+QComboBox QAbstractItemView {
+    background-color: #1a1a2e;
+    border: 1px solid #2d2d44;
+    border-radius: 10px;
+    color: #dde1f0;
+    padding: 4px;
+    outline: none;
+    selection-background-color: #7c3aed;
+    selection-color: #ffffff;
+}
+
 /* ── Console ── */
 QTextEdit#console {
     background-color: #05050a;
@@ -244,17 +333,208 @@ def sanitize(name: str) -> str:
     """Strip characters that are illegal in filenames."""
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip()
 
+
+_ytmusic_client: YTMusic | None = None
+_ytmusic_lock = threading.Lock()
+
+def ytmusic() -> YTMusic:
+    """
+    Shared YTMusic client. Constructing one per track costs a fresh setup and
+    connection each time, which adds up across a large playlist.
+    """
+    global _ytmusic_client
+    with _ytmusic_lock:
+        if _ytmusic_client is None:
+            _ytmusic_client = YTMusic()
+        return _ytmusic_client
+
 # ─── Logger ──────────────────────────────────────────────────────────────────
 
 class AppLogger(QObject):
     log_msg = pyqtSignal(str)
 
 app_logger = AppLogger()
+_log_lock = threading.Lock()
 
 def log(msg: str):
-    """Emit a log message to the console UI."""
-    app_logger.log_msg.emit(msg)
-    print(msg)
+    """Emit a timestamped log message to the console UI and stdout."""
+    stamped = f"[{datetime.now():%H:%M:%S}] {msg}"
+    app_logger.log_msg.emit(stamped)
+    # Lock around the write: print() isn't atomic, so with several rips running
+    # at once the worker threads otherwise interleave mid-line. Flush so output
+    # appears live instead of sitting in a buffer when stdout is redirected to
+    # a file (as the .app launcher does).
+    with _log_lock:
+        print(stamped, flush=True)
+
+
+def human_size(num_bytes: float) -> str:
+    """Format a byte count as a compact human-readable string."""
+    if not num_bytes:
+        return "?"
+    for unit in ("B", "KB", "MB", "GB"):
+        if num_bytes < 1024:
+            return f"{num_bytes:.1f} {unit}"
+        num_bytes /= 1024
+    return f"{num_bytes:.1f} TB"
+
+
+class YtdlpLogger:
+    """
+    Routes yt-dlp's internal output through the app logger so it lands in the
+    GUI console (and the launcher log) instead of being written straight to
+    stdout, where its carriage-return progress lines mangle everything else.
+    """
+
+    def __init__(self, tag: str) -> None:
+        self._tag = tag
+
+    def debug(self, msg: str) -> None:
+        pass  # far too noisy to surface; progress is reported via the hook
+
+    def info(self, msg: str) -> None:
+        pass
+
+    def warning(self, msg: str) -> None:
+        log(f"{self._tag} warning: {msg.strip()}")
+
+    def error(self, msg: str) -> None:
+        log(f"{self._tag} yt-dlp error: {msg.strip()}")
+
+
+def build_ydl_opts(tag: str, out_template: str, audio_format: str) -> dict:
+    """
+    Shared yt-dlp config for both rip paths: grab the best audio stream and
+    hand it to ffmpeg to produce the requested format.
+    """
+    spec = AUDIO_FORMATS.get(audio_format, AUDIO_FORMATS[DEFAULT_AUDIO_FORMAT])
+    progress_state = {"last_pct": 0}
+
+    def progress_hook(d: dict) -> None:
+        status = d.get("status")
+        if status == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            done  = d.get("downloaded_bytes") or 0
+            if not total:
+                return
+            pct = int(done * 100 / total)
+            # report roughly every 25% instead of on every chunk
+            if pct >= progress_state["last_pct"] + 25:
+                progress_state["last_pct"] = pct
+                speed = d.get("speed") or 0
+                log(f"{tag} downloading {pct}% of {human_size(total)} "
+                    f"at {human_size(speed)}/s")
+        elif status == "finished":
+            log(f"{tag} download finished, converting to {audio_format}...")
+
+    # For m4a, ask for YouTube's native AAC stream so ffmpeg can copy it
+    # straight through instead of re-encoding. Other formats re-encode anyway,
+    # so just take the best audio available.
+    fmt_selector = (
+        "bestaudio[ext=m4a]/bestaudio/best" if audio_format == "m4a"
+        else "bestaudio/best"
+    )
+
+    opts = {
+        "format": fmt_selector,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": spec["codec"],
+            "preferredquality": spec["quality"],
+        }],
+        "outtmpl": out_template,
+        "quiet": True,
+        "no_warnings": True,
+        "noprogress": True,          # suppress yt-dlp's own stdout progress bar
+        "concurrent_fragment_downloads": 4,
+        # Running several rips at once makes YouTube more likely to answer with
+        # HTTP 429. Retry with backoff and space out extraction requests a
+        # little so a throttled track recovers instead of failing outright.
+        "retries": 5,
+        "extractor_retries": 3,
+        "fragment_retries": 5,
+        "sleep_interval_requests": 0.5,
+        "logger": YtdlpLogger(tag),
+        "progress_hooks": [progress_hook],
+    }
+
+    if spec.get("pp_args"):
+        opts["postprocessor_args"] = {"extractaudio": spec["pp_args"]}
+
+    return opts
+
+
+# Errors that will never succeed on a retry — the track simply isn't available
+# to us, so retrying just burns time on every dead track in a playlist.
+PERMANENT_ERRORS = (
+    "video unavailable",
+    "private video",
+    "has been removed",
+    "removed by the uploader",
+    "members-only",
+    "confirm your age",
+    "not available in your country",
+    "does not exist",
+    "this live event has ended",
+)
+
+
+def is_permanent_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(marker in msg for marker in PERMANENT_ERRORS)
+
+
+def download_track(
+    tag: str,
+    url: str,
+    out_template: str,
+    audio_format: str,
+    attempts: int = 3,
+) -> None:
+    """
+    Download one track, retrying transient YouTube throttling (HTTP 403/429),
+    which gets more likely with several rips running at once.
+
+    Each retry builds a fresh YoutubeDL and re-runs extraction: a 403 usually
+    means the stream URL we were handed has expired or been rejected, so
+    retrying the *same* URL is useless — we need newly extracted ones.
+    Permanently unavailable tracks fail immediately instead of retrying.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            opts = build_ydl_opts(tag, out_template, audio_format)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+            return
+        except Exception as exc:
+            last_error = exc
+            if is_permanent_error(exc):
+                raise
+            if attempt < attempts:
+                delay = 2 * attempt      # 2s, then 4s
+                log(f"{tag} attempt {attempt}/{attempts} failed, retrying in {delay}s...")
+                time.sleep(delay)
+    raise last_error  # type: ignore[misc]
+
+
+def existing_rip(output_dir: Path, stem: str, audio_format: str) -> Path | None:
+    """
+    Return an already-downloaded file for this track in the requested format.
+
+    Only an exact-format match counts as "already ripped": if you deliberately
+    switch to WAV, having the track as an MP3 shouldn't stop the WAV rip.
+    """
+    candidate = output_dir / f"{stem}.{audio_format}"
+    return candidate if candidate.exists() else None
+
+
+def other_format_rips(output_dir: Path, stem: str, audio_format: str) -> list[Path]:
+    """Copies of this track in *other* formats, worth mentioning in the log."""
+    return [
+        p for ext in KNOWN_AUDIO_EXTS
+        if ext != audio_format and (p := output_dir / f"{stem}.{ext}").exists()
+    ]
 
 
 # ─── Signals ─────────────────────────────────────────────────────────────────
@@ -280,15 +560,17 @@ class SearchWorker(QThread):
 
     def run(self) -> None:
         try:
-            log(f"[Search] Querying YouTube Music for '{self.query}'...")
-            yt = YTMusic()
+            log(f"[SEARCH] Querying YouTube Music for '{self.query}'...")
+            started = time.monotonic()
+            yt = ytmusic()
             results = yt.search(self.query, filter="songs", limit=8)
             if not results:
+                log("[SEARCH] No song matches; retrying as an unfiltered search...")
                 results = yt.search(self.query, limit=8)
-            log(f"[Search] Found {len(results)} results.")
+            log(f"[SEARCH] Found {len(results)} results in {time.monotonic() - started:.1f}s")
             self.results_ready.emit(results[:8])
         except Exception as exc:
-            log(f"[Search] Error: {exc}")
+            log(f"[SEARCH] Failed: {exc}")
             self.error.emit(str(exc))
 
 
@@ -297,55 +579,55 @@ class DownloadWorker(QRunnable):
 
     def __init__(
         self,
-        video_id:   str,
-        title:      str,
-        artist:     str,
-        output_dir: Path,
-        signals:    WorkerSignals,
+        video_id:     str,
+        title:        str,
+        artist:       str,
+        output_dir:   Path,
+        signals:      WorkerSignals,
+        audio_format: str = DEFAULT_AUDIO_FORMAT,
     ) -> None:
         super().__init__()
-        self.video_id   = video_id
-        self.title      = title
-        self.artist     = artist
-        self.output_dir = output_dir
-        self.signals    = signals
+        self.video_id     = video_id
+        self.title        = title
+        self.artist       = artist
+        self.output_dir   = output_dir
+        self.signals      = signals
+        self.audio_format = audio_format
 
     def run(self) -> None:
         safe_title  = sanitize(self.title)
         safe_artist = sanitize(self.artist)
-        filename    = f"{safe_artist} - {safe_title}.mp3"
-        log(f"[Rip] Checking if {filename} already exists...")
+        stem        = f"{safe_artist} - {safe_title}"
+        filename    = f"{stem}.{self.audio_format}"
+        target      = self.output_dir / filename
+        tag         = f"[RIP] {stem}:"
 
-        if (self.output_dir / filename).exists():
-            log(f"[Rip] Skipped: {filename} already exists.")
+        already = existing_rip(self.output_dir, stem, self.audio_format)
+        if already:
+            log(f"{tag} skipped, already have {already.name}")
             self.signals.skipped.emit(self.video_id)
             return
 
-        log(f"[Rip] Starting download for {self.title} by {self.artist}...")
+        others = other_format_rips(self.output_dir, stem, self.audio_format)
+        if others:
+            log(f"{tag} have {others[0].name}, re-ripping as {self.audio_format}")
+
+        log(f"{tag} starting (video ID {self.video_id}) -> {self.output_dir}")
         self.signals.started.emit(self.video_id)
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
         url = f"https://music.youtube.com/watch?v={self.video_id}"
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "320",
-            }],
-            "outtmpl": str(self.output_dir / f"{safe_artist} - {safe_title}.%(ext)s"),
-            "quiet": True,
-            "no_warnings": True,
-        }
 
+        started = time.monotonic()
         try:
-            log(f"[Rip] Running yt-dlp for video ID: {self.video_id}...")
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-            log(f"[Rip] Success: Downloaded {filename}.")
+            download_track(
+                tag, url, str(self.output_dir / f"{stem}.%(ext)s"), self.audio_format
+            )
+            size = human_size(target.stat().st_size) if target.exists() else "?"
+            log(f"{tag} done in {time.monotonic() - started:.1f}s ({size}) -> {filename}")
             self.signals.finished.emit(self.video_id)
         except Exception as exc:
-            log(f"[Rip] Error downloading {self.title}: {exc}")
+            log(f"{tag} FAILED after {time.monotonic() - started:.1f}s - {exc}")
             self.signals.failed.emit(self.video_id, str(exc))
 
 
@@ -384,13 +666,13 @@ class PlaylistFetcher(QThread):
                     "Please paste a Spotify or Apple Music playlist URL."
                 )
         except Exception as exc:
-            log(f"[Playlist] Fatal Error during fetch: {exc}")
+            log(f"[PLAYLIST] Fatal Error during fetch: {exc}")
             self.error.emit(str(exc))
 
     # ── Spotify ──────────────────────────────────────────────────────────────
 
     def _fetch_spotify(self) -> None:
-        log(f"[Playlist] Fetching Spotify playlist info for: {self.url}...")
+        log(f"[PLAYLIST] Fetching Spotify playlist info for: {self.url}...")
         # ── 1. Resolve playlist name (no auth required) ──────────────────
         playlist_name = "Spotify Playlist"
         try:
@@ -410,14 +692,14 @@ class PlaylistFetcher(QThread):
         try:
             from spotdl import Spotdl  # type: ignore
         except ImportError:
-            log("[Playlist] Error: spotdl is not installed.")
+            log("[PLAYLIST] Error: spotdl is not installed.")
             self.error.emit(
                 "spotdl is not installed.\n"
                 "Run:  pip install spotdl   (or: pip install -r requirements_gui.txt)"
             )
             return
 
-        log(f"[Playlist] spotdl found. Extracting tracks (this may take a moment)...")
+        log(f"[PLAYLIST] spotdl found. Extracting tracks (this may take a moment)...")
 
         # Hook into spotdl to log each track as it's parsed from the playlist
         from spotdl.types.song import Song as SpotdlSong  # type: ignore
@@ -430,7 +712,7 @@ class PlaylistFetcher(QThread):
             _track_counter[0] += 1
             artists = getattr(song, 'artists', None) or []
             artist_name = artists[0] if (artists and isinstance(artists[0], str)) else (getattr(song, 'artist', None) or "Unknown")
-            log(f"[Playlist] #{_track_counter[0]:>3d}  {artist_name} - {song.name}")
+            log(f"[PLAYLIST] #{_track_counter[0]:>3d}  {artist_name} - {song.name}")
             return song
 
         SpotdlSong.from_missing_data = _hooked_from_missing
@@ -445,13 +727,13 @@ class PlaylistFetcher(QThread):
             # Restore original method so repeated fetches don't stack hooks
             SpotdlSong.from_missing_data = classmethod(_original_from_missing)
 
-        log(f"[Playlist] Successfully extracted {len(songs)} tracks from playlist '{playlist_name}'.")
+        log(f"[PLAYLIST] Successfully extracted {len(songs)} tracks from playlist '{playlist_name}'.")
         self.tracks_ready.emit(playlist_name, songs)
 
     # ── Apple Music ──────────────────────────────────────────────────────────
 
     def _fetch_apple_music(self) -> None:
-        log(f"[Playlist] Fetching Apple Music playlist info for: {self.url}...")
+        log(f"[PLAYLIST] Fetching Apple Music playlist info for: {self.url}...")
 
         req = urllib.request.Request(self.url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -504,9 +786,9 @@ class PlaylistFetcher(QThread):
             subtitle_links = item.get("subtitleLinks") or []
             artist = subtitle_links[0]["title"] if subtitle_links else "Unknown Artist"
             songs.append(SimpleSong(name=title, artists=[artist]))
-            log(f"[Playlist] #{i:>3d}  {artist} - {title}")
+            log(f"[PLAYLIST] #{i:>3d}  {artist} - {title}")
 
-        log(f"[Playlist] Successfully extracted {len(songs)} tracks from playlist '{playlist_name}'.")
+        log(f"[PLAYLIST] Successfully extracted {len(songs)} tracks from playlist '{playlist_name}'.")
         self.tracks_ready.emit(playlist_name, songs)
 
 
@@ -520,16 +802,20 @@ class PlaylistTrackDownloader(QRunnable):
         self,
         song:       object,           # spotdl Song
         output_dir: Path,
-        signals:    WorkerSignals,
-        track_id:   str,
+        signals:      WorkerSignals,
+        track_id:     str,
+        audio_format: str = DEFAULT_AUDIO_FORMAT,
     ) -> None:
         super().__init__()
-        self.song       = song
-        self.output_dir = output_dir
-        self.signals    = signals
-        self.track_id   = track_id
+        self.song         = song
+        self.output_dir   = output_dir
+        self.signals      = signals
+        self.track_id     = track_id
+        self.audio_format = audio_format
 
     def run(self) -> None:
+        tag = "[RIP]"
+        started = time.monotonic()
         try:
             title   = self.song.name
             artists = self.song.artists or ["Unknown"]
@@ -538,58 +824,51 @@ class PlaylistTrackDownloader(QRunnable):
 
             safe_title  = sanitize(title)
             safe_artist = sanitize(artist)
-            filename    = f"{safe_artist} - {safe_title}.mp3"
+            stem        = f"{safe_artist} - {safe_title}"
+            filename    = f"{stem}.{self.audio_format}"
+            target      = self.output_dir / filename
+            tag         = f"[RIP] {stem}:"
 
-            log(f"[{title}] Checking if {filename} already exists...")
-            if (self.output_dir / filename).exists():
-                log(f"[{title}] Skipped: already exists.")
+            already = existing_rip(self.output_dir, stem, self.audio_format)
+            if already:
+                log(f"{tag} skipped, already have {already.name}")
                 self.signals.skipped.emit(self.track_id)
                 return
 
             self.signals.started.emit(self.track_id)
             self.output_dir.mkdir(parents=True, exist_ok=True)
 
-            log(f"[{title}] Searching YouTube Music for best match...")
-            # Search YouTube Music for the best match
-            yt      = YTMusic()
+            log(f"{tag} matching on YouTube Music...")
+            yt      = ytmusic()
             query   = f"{artist} {title}"
             results = yt.search(query, filter="songs", limit=1)
             if not results:
                 results = yt.search(query, limit=1)
 
             if not results:
-                log(f"[{title}] Failed: Not found on YouTube Music.")
+                log(f"{tag} FAILED - no match on YouTube Music")
                 self.signals.failed.emit(self.track_id, "Not found on YouTube Music")
                 return
 
             video_id = results[0].get("videoId")
             if not video_id:
-                log(f"[{title}] Failed: No video ID found.")
+                log(f"{tag} FAILED - match had no video ID")
                 self.signals.failed.emit(self.track_id, "No video ID found")
                 return
 
-            log(f"[{title}] Found match (ID: {video_id}). Starting yt-dlp download...")
+            log(f"{tag} matched video ID {video_id} -> {self.output_dir}")
             url = f"https://music.youtube.com/watch?v={video_id}"
-            ydl_opts = {
-                "format": "bestaudio/best",
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "320",
-                }],
-                "outtmpl": str(self.output_dir / f"{safe_artist} - {safe_title}.%(ext)s"),
-                "quiet": True,
-                "no_warnings": True,
-            }
 
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-            
-            log(f"[{title}] Success: Download complete.")
+            download_track(
+                tag, url, str(self.output_dir / f"{stem}.%(ext)s"), self.audio_format
+            )
+
+            size = human_size(target.stat().st_size) if target.exists() else "?"
+            log(f"{tag} done in {time.monotonic() - started:.1f}s ({size}) -> {filename}")
             self.signals.finished.emit(self.track_id)
 
         except Exception as exc:
-            log(f"[{title}] Error: {exc}")
+            log(f"{tag} FAILED after {time.monotonic() - started:.1f}s - {exc}")
             self.signals.failed.emit(self.track_id, str(exc))
 
 
@@ -739,9 +1018,37 @@ class TrackRow(QWidget):
         return self.checkbox.isChecked()
 
 
+class FormatSetting(QObject):
+    """
+    App-wide "what format do we rip to" setting. Both tabs show a picker, and
+    this keeps them in sync (and persisted) rather than letting each tab drift.
+    """
+    changed = pyqtSignal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._settings = QSettings("RippedRipper", "RipperGUI")
+        stored = self._settings.value("audio_format", DEFAULT_AUDIO_FORMAT)
+        self._value = stored if stored in AUDIO_FORMATS else DEFAULT_AUDIO_FORMAT
+
+    def value(self) -> str:
+        return self._value
+
+    def set_value(self, fmt: str) -> None:
+        if fmt not in AUDIO_FORMATS or fmt == self._value:
+            return
+        self._value = fmt
+        self._settings.setValue("audio_format", fmt)
+        log(f"[SETTINGS] Output format set to {fmt}")
+        self.changed.emit(fmt)
+
+
+audio_format_setting = FormatSetting()
+
+
 class OutputFolderRow(QWidget):
     """
-    'Save to: <path>  [Choose Folder…]' row.
+    'Save to: <path>  [Choose Folder…]   Format: [ ▾ ]' row.
     The native folder picker lets the user create a new folder in place,
     so this covers both "pick a location" and "make a new folder" in one dialog.
     """
@@ -768,9 +1075,29 @@ class OutputFolderRow(QWidget):
         choose_btn.setFixedHeight(38)
         choose_btn.clicked.connect(self._choose)
 
+        fmt_tag = QLabel("Format:")
+        fmt_tag.setStyleSheet("color: #64748b; font-size: 12px; font-weight: 700; background: transparent;")
+
+        self._fmt_combo = QComboBox()
+        self._fmt_combo.setFixedHeight(38)
+        self._fmt_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        for key, spec in AUDIO_FORMATS.items():
+            self._fmt_combo.addItem(spec["label"], key)
+            self._fmt_combo.setItemData(
+                self._fmt_combo.count() - 1, spec["hint"], Qt.ItemDataRole.ToolTipRole
+            )
+        self._fmt_combo.setCurrentIndex(
+            self._fmt_combo.findData(audio_format_setting.value())
+        )
+        self._fmt_combo.currentIndexChanged.connect(self._on_format_picked)
+        # Follow changes made from the other tab's picker
+        audio_format_setting.changed.connect(self._sync_format)
+
         layout.addWidget(tag)
         layout.addWidget(self._path_lbl, stretch=1)
         layout.addWidget(choose_btn)
+        layout.addWidget(fmt_tag)
+        layout.addWidget(self._fmt_combo)
 
     def _choose(self) -> None:
         chosen = QFileDialog.getExistingDirectory(
@@ -783,6 +1110,16 @@ class OutputFolderRow(QWidget):
             self._dir = Path(chosen)
             self._path_lbl.setText(str(self._dir))
             self.changed.emit(self._dir)
+
+    def _on_format_picked(self, _index: int) -> None:
+        audio_format_setting.set_value(self._fmt_combo.currentData())
+
+    def _sync_format(self, fmt: str) -> None:
+        idx = self._fmt_combo.findData(fmt)
+        if idx >= 0 and idx != self._fmt_combo.currentIndex():
+            self._fmt_combo.blockSignals(True)
+            self._fmt_combo.setCurrentIndex(idx)
+            self._fmt_combo.blockSignals(False)
 
     def path(self) -> Path:
         return self._dir
@@ -830,7 +1167,7 @@ class SearchTab(QWidget):
         root.addWidget(self._folder_row)
 
         # ── Status ──────────────────────────────────────────────────────────
-        self._status = QLabel("Search for any track to download a 320 kbps MP3")
+        self._status = QLabel("Search for any track to rip it in your chosen format")
         self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._status.setStyleSheet("color: #44446a; font-size: 13px;")
         root.addWidget(self._status)
@@ -927,7 +1264,9 @@ class SearchTab(QWidget):
         sigs.skipped.connect(lambda tid:  self._update_card(tid, "skipped"))
         sigs.failed.connect(lambda tid, _: self._update_card(tid, "failed"))
 
-        worker = DownloadWorker(vid, title, artist, self._output_dir, sigs)
+        worker = DownloadWorker(
+            vid, title, artist, self._output_dir, sigs, audio_format_setting.value()
+        )
         self._pool.start(worker)
 
     def _update_card(self, track_id: str, status: str) -> None:
@@ -953,6 +1292,8 @@ class PlaylistTab(QWidget):
         self._playlist_name = ""
         self._total         = 0
         self._completed     = 0
+        self._tally         = {"done": 0, "skipped": 0, "failed": 0}
+        self._batch_started = 0.0
 
         self._settings = QSettings("RippedRipper", "RipperGUI")
         self._output_dir = Path(self._settings.value("playlist_output_dir", str(PLAYLIST_DIR)))
@@ -1115,6 +1456,8 @@ class PlaylistTab(QWidget):
 
         self._total     = len(selected)
         self._completed = 0
+        self._tally     = {"done": 0, "skipped": 0, "failed": 0}
+        self._batch_started = time.monotonic()
         self._download_btn.setEnabled(False)
         self._download_btn.setText("Downloading...")
 
@@ -1125,6 +1468,9 @@ class PlaylistTab(QWidget):
 
         out_dir = self._output_dir / sanitize(self._playlist_name or "Playlist")
         out_dir.mkdir(parents=True, exist_ok=True)
+
+        log(f"[PLAYLIST] Batch start: {self._total} tracks -> {out_dir} "
+            f"({MAX_WORKERS} at a time)")
 
         for tid, row in selected:
             row.set_status("waiting")
@@ -1138,7 +1484,9 @@ class PlaylistTab(QWidget):
             sigs.skipped.connect(lambda t:    self._on_track_done(t, "skipped"))
             sigs.failed.connect(lambda t, _:  self._on_track_done(t, "failed"))
 
-            worker = PlaylistTrackDownloader(song, out_dir, sigs, tid)
+            worker = PlaylistTrackDownloader(
+                song, out_dir, sigs, tid, audio_format_setting.value()
+            )
             self._pool.start(worker)
 
     def _on_track_started(self, track_id: str) -> None:
@@ -1151,14 +1499,22 @@ class PlaylistTab(QWidget):
         if row:
             row.set_status(status)
         self._completed += 1
+        self._tally[status] = self._tally.get(status, 0) + 1
         self._progress_bar.setValue(self._completed)
+
+        tally = (f"{self._tally['done']} done, {self._tally['skipped']} skipped, "
+                 f"{self._tally['failed']} failed")
+
         if self._completed >= self._total:
+            elapsed = time.monotonic() - self._batch_started
+            log(f"[PLAYLIST] Batch complete in {elapsed:.1f}s - {tally}")
             self._progress_lbl.setText(
                 f"All done - {self._total} tracks processed"
             )
             self._download_btn.setEnabled(True)
             self._download_btn.setText("Download Selected")
         else:
+            log(f"[PLAYLIST] Progress {self._completed}/{self._total} - {tally}")
             self._progress_lbl.setText(f"{self._completed} / {self._total}")
 
     def _open_folder(self) -> None:
@@ -1200,13 +1556,8 @@ class MainWindow(QMainWindow):
             "color: #a78bfa; letter-spacing: -0.5px; background: transparent;"
         )
 
-        tag = QLabel("Search & Rip  ·  Spotify & Apple Music Playlists  ·  320 kbps MP3")
-        tag.setStyleSheet("color: #64748b; font-size: 13px; font-weight: 600; background: transparent;")
-        tag.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-
         hdr.addWidget(logo)
         hdr.addStretch()
-        hdr.addWidget(tag)
         layout.addLayout(hdr)
 
         # ── Divider ──────────────────────────────────────────────────────────
@@ -1221,7 +1572,9 @@ class MainWindow(QMainWindow):
 
         # ── Tabs ─────────────────────────────────────────────────────────────
         tabs = QTabWidget()
-        tabs.addTab(SearchTab(pool),   "Search & Rip")
+        # "&&" escapes the ampersand — a single "&" is read as a mnemonic marker
+        # and renders as a stray underline in the tab label.
+        tabs.addTab(SearchTab(pool),   "Search && Rip")
         tabs.addTab(PlaylistTab(pool), "Playlist Ripper")
         splitter.addWidget(tabs)
 

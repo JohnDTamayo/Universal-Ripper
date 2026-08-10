@@ -3,3 +3,6 @@ PyQt6
 spotdl
 ytmusicapi
 yt-dlp
+# Used by the setup scripts to generate assets/icon.ico. It currently arrives
+# indirectly via spotdl, but the icon step breaks silently without it.
+Pillow

@@ -37,11 +37,12 @@ sleep 3
 # 5. Fetch the Ngrok URL (so you can update your HTML if it changed)
 NGROK_URL=$(curl -s http://127.0.0.1:4040/api/tunnels | jq -r '.tunnels[0].public_url')
 
-if [ "$NGROK_URL" != "null" ]; then
+if [ "$NGROK_URL" != "null" ] && [ -n "$NGROK_URL" ]; then
     echo "✅ Tunnel Live: $NGROK_URL"
-    echo "⚠️  Make sure this matches the API_BASE_URL in your HTML files!"
+    echo "   Share that link with your guests."
 else
-    echo "❌ Ngrok failed to start or 'jq' is not installed."
+    echo "❌ Ngrok failed to start, or 'jq'/'ngrok' is not installed."
+    echo "   The DJ dashboard still works locally at $DJ_URL"
 fi
 
 # 6. Launch DJ Dashboard

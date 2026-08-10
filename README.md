@@ -9,7 +9,8 @@ Automated music request and ripping toolkit for live DJ sets. Guests submit song
 - **Desktop GUI** — native PyQt6 app for search-and-rip or playlist batch downloads
 - **Playlist Ripping** — paste a Spotify or Apple Music playlist link to fetch and rip every track
 - **Universal Search** — real-time YouTube Music search for any track
-- **320kbps MP3s** — automated download and conversion via `yt-dlp`
+- **Choose Your Format** — rip to MP3, M4A, FLAC or WAV; all four load in Traktor, Serato, Rekordbox and VirtualDJ
+- **Parallel Ripping** — up to 8 tracks at once, with retry/backoff when YouTube throttles
 - **Custom Save Location** — choose or create any folder as the download destination
 
 ## Tech Stack
@@ -47,6 +48,17 @@ Share the generated Ngrok URL with your guests.
 **Launch afterward**:
 - macOS: `launch_gui.command`, or the **Ripped Ripper** app on your Desktop
 - Windows: `launch_gui.bat`, or the **Ripped Ripper** shortcut on your Desktop
+
+**Output format** — pick one from the `Format` dropdown; the choice is remembered and applies to both tabs.
+
+| Format | Size / track | Notes |
+|---|---|---|
+| MP3 | ~9 MB | 320 kbps, widest compatibility (default) |
+| M4A | ~4 MB | AAC copied as-is — no re-encode, fastest |
+| FLAC | ~24 MB | Lossless container, 16-bit |
+| WAV | ~44 MB | Lossless, no metadata support |
+
+The source is YouTube Music's ~129 kbps stream, which is the quality ceiling for every option. M4A copies that stream untouched; the others re-encode it, and the lossless formats store the same lossy audio in a much larger file rather than recovering anything.
 
 ## Authors
 
