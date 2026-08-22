@@ -15,9 +15,10 @@ import sys
 import json
 import time
 import threading
+import subprocess
 import urllib.request
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from PyQt6.QtCore import (
@@ -95,6 +96,205 @@ KNOWN_AUDIO_EXTS = tuple(AUDIO_FORMATS)
 # spotdl's publicly bundled Spotify credentials (from their open-source repo)
 SPOTDL_CLIENT_ID     = "5f573c9620494bae87890c0f08a60293"
 SPOTDL_CLIENT_SECRET = "212476d9b0f3472eaa762d90b19b0ba8"
+
+
+# ─── Dependency auto-update ────────────────────────────────────────────────────
+#
+# yt-dlp, ytmusicapi, and spotdl all wrap unofficial/reverse-engineered APIs
+# (YouTube's player internals, YouTube Music's internal API, Spotify's client
+# auth) that their providers change without notice — "it worked yesterday"
+# breakage that gets fixed by a point release, often within days. A stale
+# install is the single most likely reason rips or playlist fetches start
+# failing, so each of these is checked against PyPI once a day and upgraded
+# automatically when it's safe to.
+#
+# Deliberately NOT included: PyQt6, fastapi/starlette/uvicorn/jinja2, Pillow.
+# None of those are in an adversarial relationship with anything — they don't
+# need to chase a moving target, and blindly auto-upgrading them trades one
+# kind of silent breakage for another (this is exactly what happened when
+# spotdl's fastapi<0.104 pin broke the web dashboard after an unrelated venv
+# rebuild).
+#
+# Two different safety policies are used, matched to how each package can
+# actually break us:
+#   - yt-dlp and ytmusicapi are bounded by whatever range spotdl itself
+#     currently declares for them, read live from spotdl's package metadata.
+#     We only use their stable public APIs, so anything within spotdl's own
+#     accepted range is safe.
+#   - spotdl has no upstream bound in our stack, and we touch one of its
+#     undocumented internal methods (see the try/except around
+#     SpotdlSong.from_missing_data in _fetch_spotify — deliberately made
+#     failure-tolerant for exactly this reason). semver only promises no
+#     breaking changes below a major version bump, so spotdl self-limits to
+#     the current major version and just logs an advisory beyond that,
+#     leaving a major upgrade to a manual decision.
+
+def version_tuple(v: str) -> tuple[int, ...]:
+    """
+    Parse a dotted version like '2026.8.19' or '4.5.2' into (2026, 8, 19) or
+    (4, 5, 2). Good enough for yt-dlp's date-based scheme and everyone else's
+    semver — not a general PEP 440 parser (no pre-release/epoch handling,
+    which none of these three packages' stable releases need).
+    """
+    nums = re.findall(r"\d+", v)
+    return tuple(int(n) for n in nums) if nums else (0,)
+
+
+def installed_version(package: str) -> str | None:
+    """Installed version of a package, or None if it isn't installed."""
+    try:
+        import importlib.metadata as md
+        return md.version(package)
+    except Exception:
+        return None
+
+
+def dependent_version_bounds(
+    dependent: str, target: str
+) -> tuple[tuple[int, ...] | None, tuple[int, ...] | None]:
+    """
+    Read `dependent`'s own declared version range for `target` (e.g. spotdl's
+    'yt-dlp<2027,>=2026.07.04') from installed package metadata, so we always
+    respect whatever the dependent currently requires rather than a bound
+    hardcoded here that could go stale the moment spotdl changes its pin.
+    Returns (min, max) as tuples; either may be None if there's no such bound,
+    or if `dependent` isn't installed / the requirement is unparsable.
+    """
+    def req_name(req: str) -> str:
+        # A requirement string is "name[extras]<specifier>; marker" — the
+        # specifier butts directly against the name with no separator when
+        # there are no extras (e.g. "ytmusicapi<2,>=1.12.1"), so only a
+        # regex on the leading name-ish characters reliably isolates it.
+        m = re.match(r"^([A-Za-z0-9_.\-]+)", req.split(";")[0].strip())
+        return m.group(1).lower().replace("_", "-") if m else ""
+
+    try:
+        import importlib.metadata as md
+        target_norm = target.lower().replace("_", "-")
+        req = next(
+            (r for r in (md.requires(dependent) or []) if req_name(r) == target_norm),
+            None,
+        )
+    except Exception:
+        return None, None
+    if not req:
+        return None, None
+
+    lo = hi = None
+    for op, val in re.findall(r"(>=|<=|==|<|>)\s*([0-9][0-9.]*)", req):
+        v = version_tuple(val)
+        if op in (">=", ">"):
+            lo = v
+        elif op in ("<=", "<"):
+            hi = v
+    return lo, hi
+
+
+def same_major_ceiling(current_version: str) -> tuple[int, ...]:
+    """
+    Self-imposed ceiling for a package nothing in our stack bounds: allow
+    patch/minor updates but stop at the next major version, matching semver's
+    only real promise (no breaking changes below a major bump).
+    """
+    major = version_tuple(current_version)[0]
+    return (major + 1,)
+
+
+@dataclass
+class UpdatePolicy:
+    package:  str                                          # PyPI package name
+    version_getter: object                                 # () -> str | None
+    bounds_getter:  object                                  # () -> (lo, hi)
+
+
+UPDATE_POLICIES = [
+    UpdatePolicy(
+        package="yt-dlp",
+        version_getter=lambda: installed_version("yt-dlp"),
+        bounds_getter=lambda: dependent_version_bounds("spotdl", "yt-dlp"),
+    ),
+    UpdatePolicy(
+        package="ytmusicapi",
+        version_getter=lambda: installed_version("ytmusicapi"),
+        bounds_getter=lambda: dependent_version_bounds("spotdl", "ytmusicapi"),
+    ),
+    UpdatePolicy(
+        package="spotdl",
+        version_getter=lambda: installed_version("spotdl"),
+        # No dependent bound exists for spotdl itself — self-limit to its
+        # current major version instead (see the module comment above).
+        bounds_getter=lambda: (None, same_major_ceiling(installed_version("spotdl") or "0")),
+    ),
+]
+
+
+class UpdateChecker(QThread):
+    """
+    Background, once-a-day-per-package check against PyPI. Installs in-place
+    via pip if a newer version is available and still within the policy's
+    bound. Silent on any failure (offline, PyPI unreachable, package not
+    installed, etc.) — this is best-effort maintenance, never something that
+    should interrupt using the app.
+    """
+
+    def __init__(self, policy: UpdatePolicy) -> None:
+        super().__init__()
+        self._p = policy
+
+    def run(self) -> None:
+        p = self._p
+        settings = QSettings("RippedRipper", "RipperGUI")
+        settings_key = f"update_check_{p.package}"
+        today = datetime.now(timezone.utc).date().isoformat()
+        if settings.value(settings_key) == today:
+            return  # already checked today
+
+        installed_str = p.version_getter()
+        if not installed_str:
+            return  # not installed in this environment; nothing to update
+
+        try:
+            req = urllib.request.Request(
+                f"https://pypi.org/pypi/{p.package}/json", headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                latest_str = json.loads(resp.read())["info"]["version"]
+        except Exception as exc:
+            log(f"[UPDATE] Couldn't check for {p.package} updates: {exc}")
+            return
+
+        settings.setValue(settings_key, today)
+
+        installed = version_tuple(installed_str)
+        latest    = version_tuple(latest_str)
+        if latest <= installed:
+            log(f"[UPDATE] {p.package} {installed_str} is current.")
+            return
+
+        lo, hi = p.bounds_getter()
+        if hi is not None and latest >= hi:
+            log(f"[UPDATE] {p.package} {latest_str} is available but exceeds the allowed "
+                f"version (<{'.'.join(map(str, hi))}) — skipping. Update it manually if you want it.")
+            return
+
+        log(f"[UPDATE] {p.package} {installed_str} -> {latest_str} available, updating...")
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--upgrade",
+                 "--disable-pip-version-check", f"{p.package}=={latest_str}"],
+                capture_output=True, text=True, timeout=90,
+            )
+        except Exception as exc:
+            log(f"[UPDATE] {p.package} update failed to run: {exc}")
+            return
+
+        if result.returncode == 0:
+            log(f"[UPDATE] {p.package} updated to {latest_str}. "
+                f"Restart Ripped Ripper to use it.")
+        else:
+            detail = (result.stderr or result.stdout or "").strip().splitlines()
+            detail = detail[-1] if detail else "unknown error"
+            log(f"[UPDATE] {p.package} update failed: {detail}")
 
 
 # ─── Stylesheet ──────────────────────────────────────────────────────────────
@@ -701,21 +901,31 @@ class PlaylistFetcher(QThread):
 
         log(f"[PLAYLIST] spotdl found. Extracting tracks (this may take a moment)...")
 
-        # Hook into spotdl to log each track as it's parsed from the playlist
-        from spotdl.types.song import Song as SpotdlSong  # type: ignore
-        _original_from_missing = SpotdlSong.from_missing_data.__func__
-        _track_counter = [0]
+        # Hook into spotdl to log each track as it's parsed from the playlist.
+        # This touches an undocumented internal method with no API stability
+        # guarantee, so a spotdl update could rename or remove it at any time —
+        # if that happens, skip the nice per-track logging rather than failing
+        # the whole playlist fetch over what's just a progress cosmetic.
+        hook_installed = False
+        _original_from_missing = None
+        try:
+            from spotdl.types.song import Song as SpotdlSong  # type: ignore
+            _original_from_missing = SpotdlSong.from_missing_data.__func__
+            _track_counter = [0]
 
-        @classmethod  # type: ignore
-        def _hooked_from_missing(cls, **kwargs):
-            song = _original_from_missing(cls, **kwargs)
-            _track_counter[0] += 1
-            artists = getattr(song, 'artists', None) or []
-            artist_name = artists[0] if (artists and isinstance(artists[0], str)) else (getattr(song, 'artist', None) or "Unknown")
-            log(f"[PLAYLIST] #{_track_counter[0]:>3d}  {artist_name} - {song.name}")
-            return song
+            @classmethod  # type: ignore
+            def _hooked_from_missing(cls, **kwargs):
+                song = _original_from_missing(cls, **kwargs)
+                _track_counter[0] += 1
+                artists = getattr(song, 'artists', None) or []
+                artist_name = artists[0] if (artists and isinstance(artists[0], str)) else (getattr(song, 'artist', None) or "Unknown")
+                log(f"[PLAYLIST] #{_track_counter[0]:>3d}  {artist_name} - {song.name}")
+                return song
 
-        SpotdlSong.from_missing_data = _hooked_from_missing
+            SpotdlSong.from_missing_data = _hooked_from_missing
+            hook_installed = True
+        except Exception as exc:
+            log(f"[PLAYLIST] Note: per-track progress logging unavailable ({exc}); continuing without it.")
 
         try:
             client = Spotdl(
@@ -725,7 +935,8 @@ class PlaylistFetcher(QThread):
             songs = client.search([self.url])
         finally:
             # Restore original method so repeated fetches don't stack hooks
-            SpotdlSong.from_missing_data = classmethod(_original_from_missing)
+            if hook_installed:
+                SpotdlSong.from_missing_data = classmethod(_original_from_missing)
 
         log(f"[PLAYLIST] Successfully extracted {len(songs)} tracks from playlist '{playlist_name}'.")
         self.tracks_ready.emit(playlist_name, songs)
@@ -1598,6 +1809,12 @@ class MainWindow(QMainWindow):
 
         app_logger.log_msg.connect(self._append_log)
         log("Ripper GUI initialized. Ready.")
+
+        # Non-blocking: launch happens immediately, each checker reports in
+        # whenever its PyPI check + optional install finishes.
+        self._update_checkers = [UpdateChecker(policy) for policy in UPDATE_POLICIES]
+        for checker in self._update_checkers:
+            checker.start()
 
     def _append_log(self, msg: str) -> None:
         self.console.append(msg)

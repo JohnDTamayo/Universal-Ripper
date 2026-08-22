@@ -385,17 +385,29 @@
                     const type = result.album ? 'Official Release' : 'Video/Other';
                     const duration = result.duration || '--:--';
                     const query = `${result.title} ${artist}`;
-                    
-                    div.innerHTML = `
-                        <div>
-                            <strong>${result.title}</strong><br>
-                            <span style="font-size: 0.8em; color: var(--text-muted);">${artist} | ${type} | ${duration}</span>
-                        </div>
-                        <button class="btn-rip">Rip</button>
-                    `;
-                    
+
+                    // title/artist come from YouTube Music, not our own data —
+                    // built with textContent rather than innerHTML for the same
+                    // reason as the queue table below.
+                    const info = document.createElement('div');
+                    const strong = document.createElement('strong');
+                    strong.textContent = result.title;
+                    const meta = document.createElement('span');
+                    meta.style.fontSize = '0.8em';
+                    meta.style.color = 'var(--text-muted)';
+                    meta.textContent = `${artist} | ${type} | ${duration}`;
+                    info.appendChild(strong);
+                    info.appendChild(document.createElement('br'));
+                    info.appendChild(meta);
+
+                    const ripBtn = document.createElement('button');
+                    ripBtn.className = 'btn-rip';
+                    ripBtn.textContent = 'Rip';
                     // Use addEventListener instead of onclick to safely handle special characters
-                    div.querySelector('.btn-rip').addEventListener('click', () => ripSong(query));
+                    ripBtn.addEventListener('click', () => ripSong(query));
+
+                    div.appendChild(info);
+                    div.appendChild(ripBtn);
                     resultsDiv.appendChild(div);
                 });
             } catch (error) {
@@ -449,30 +461,50 @@
                 }
 
                 queue.forEach(item => {
+                    // song/artist come from guest.html's public request form, so
+                    // they're set via textContent below rather than interpolated
+                    // into an innerHTML string — otherwise a request title could
+                    // inject a script that runs in the DJ's own dashboard.
                     const tr = document.createElement('tr');
                     tr.className = `status-${item.status}`;
-                    
+
                     const isChecked = item.status === 'selected' ? 'checked' : '';
-                    
-                    tr.innerHTML = `
-                        <td>
-                            <label class="checkbox-container">
-                                <input type="checkbox" ${isChecked} onchange="updateStatus(${item.id}, this.checked)">
-                                <span class="checkmark"></span>
-                            </label>
-                        </td>
-                        <td><strong>${item.song}</strong></td>
-                        <td>${item.artist}</td>
-                        <td style="color: var(--text-muted);">${item.status}</td>
-                        <td>
-                            <button class="btn-danger" onclick="deleteRequest(${item.id})" title="Delete Request">
-                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
-                                    <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
-                                    <path fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
-                                </svg>
-                            </button>
-                        </td>
+
+                    const tdCheckbox = document.createElement('td');
+                    tdCheckbox.innerHTML = `
+                        <label class="checkbox-container">
+                            <input type="checkbox" ${isChecked} onchange="updateStatus(${item.id}, this.checked)">
+                            <span class="checkmark"></span>
+                        </label>
                     `;
+
+                    const tdSong = document.createElement('td');
+                    const strong = document.createElement('strong');
+                    strong.textContent = item.song;
+                    tdSong.appendChild(strong);
+
+                    const tdArtist = document.createElement('td');
+                    tdArtist.textContent = item.artist;
+
+                    const tdStatus = document.createElement('td');
+                    tdStatus.style.color = 'var(--text-muted)';
+                    tdStatus.textContent = item.status;
+
+                    const tdActions = document.createElement('td');
+                    tdActions.innerHTML = `
+                        <button class="btn-danger" onclick="deleteRequest(${item.id})" title="Delete Request">
+                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" viewBox="0 0 16 16">
+                                <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5zm3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0V6z"/>
+                                <path fill-rule="evenodd" d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1-1-1V2a1 1 0 0 1 1-1H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1v1zM4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4H4.118zM2.5 3V2h11v1h-11z"/>
+                            </svg>
+                        </button>
+                    `;
+
+                    tr.appendChild(tdCheckbox);
+                    tr.appendChild(tdSong);
+                    tr.appendChild(tdArtist);
+                    tr.appendChild(tdStatus);
+                    tr.appendChild(tdActions);
                     tbody.appendChild(tr);
                 });
             } catch (error) {

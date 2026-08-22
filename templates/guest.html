@@ -245,21 +245,40 @@
                 }
 
                 queue.forEach(item => {
+                    // Built with textContent rather than innerHTML: song/artist
+                    // are guest-submitted text, and interpolating them into an
+                    // HTML string would let a request title inject a script
+                    // that runs in everyone else's browser (including the DJ's).
                     const div = document.createElement('div');
                     div.className = `queue-item status-${item.status}`;
-                    
-                    let statusIcon = '';
+
+                    const details = document.createElement('div');
+                    details.className = 'song-details';
+
+                    const titleSpan = document.createElement('span');
+                    titleSpan.className = 'song-title';
+                    titleSpan.textContent = item.song;
                     if (item.status === 'selected') {
-                        statusIcon = '<span class="star">⭐</span>';
+                        const star = document.createElement('span');
+                        star.className = 'star';
+                        star.textContent = ' ⭐';
+                        titleSpan.appendChild(star);
                     }
 
-                    div.innerHTML = `
-                        <div class="song-details">
-                            <span class="song-title">${item.song} ${statusIcon}</span>
-                            <span class="song-artist">${item.artist}</span>
-                        </div>
-                        <span style="font-size: 0.8em; color: var(--text-muted);">${item.status}</span>
-                    `;
+                    const artistSpan = document.createElement('span');
+                    artistSpan.className = 'song-artist';
+                    artistSpan.textContent = item.artist;
+
+                    details.appendChild(titleSpan);
+                    details.appendChild(artistSpan);
+
+                    const statusSpan = document.createElement('span');
+                    statusSpan.style.fontSize = '0.8em';
+                    statusSpan.style.color = 'var(--text-muted)';
+                    statusSpan.textContent = item.status;
+
+                    div.appendChild(details);
+                    div.appendChild(statusSpan);
                     container.appendChild(div);
                 });
             } catch (error) {
