@@ -14,22 +14,25 @@ import re
 import sys
 import json
 import time
+import colorsys
+import tempfile
 import threading
 import subprocess
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from string import Template
 
 from PyQt6.QtCore import (
     QObject, QRunnable, QSettings, QThread, QThreadPool,
     Qt, pyqtSignal, QUrl,
 )
-from PyQt6.QtGui import QFont, QDesktopServices
+from PyQt6.QtGui import QFont, QColor, QDesktopServices
 from PyQt6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QProgressBar, QPushButton, QScrollArea,
-    QTabWidget, QVBoxLayout, QWidget, QCheckBox,
+    QApplication, QColorDialog, QComboBox, QFileDialog, QFrame, QHBoxLayout,
+    QLabel, QLineEdit, QMainWindow, QProgressBar, QPushButton, QScrollArea,
+    QSizePolicy, QSlider, QSpinBox, QTabWidget, QVBoxLayout, QWidget, QCheckBox,
     QTextEdit, QSplitter
 )
 
@@ -237,16 +240,17 @@ class UpdateChecker(QThread):
     should interrupt using the app.
     """
 
-    def __init__(self, policy: UpdatePolicy) -> None:
+    def __init__(self, policy: UpdatePolicy, force: bool = False) -> None:
         super().__init__()
         self._p = policy
+        self._force = force
 
     def run(self) -> None:
         p = self._p
         settings = QSettings("RippedRipper", "RipperGUI")
         settings_key = f"update_check_{p.package}"
         today = datetime.now(timezone.utc).date().isoformat()
-        if settings.value(settings_key) == today:
+        if not self._force and settings.value(settings_key) == today:
             return  # already checked today
 
         installed_str = p.version_getter()
@@ -297,12 +301,88 @@ class UpdateChecker(QThread):
             log(f"[UPDATE] {p.package} update failed: {detail}")
 
 
-# ─── Stylesheet ──────────────────────────────────────────────────────────────
+# ─── Theming ─────────────────────────────────────────────────────────────────
+#
+# Everything visually customizable — accent color and text size — is driven
+# from two values through this one template, rather than scattered hardcoded
+# hex/px literals. Uses string.Template ($token) rather than str.format/f-string
+# because the stylesheet is full of literal { } (every QSS rule block), which
+# .format() would otherwise require escaping throughout.
+#
+# Status colors (success green, warning amber, error red) and the dark
+# background/surface palette are intentionally NOT derived from the accent —
+# they're semantic or structural, and letting an arbitrary accent choice repaint
+# them risks illegible combinations. Only the accent-family swatches below (the
+# ones that were already all one purple/indigo family) are derived from the
+# single color the user picks.
 
-STYLE = """
+DEFAULT_ACCENT    = "#8b5cf6"
+DEFAULT_FONT_SCALE = 1.0   # 1.0 = the sizes the UI was designed at
+
+
+def _hex_to_rgb(hex_color: str) -> tuple[float, float, float]:
+    h = hex_color.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+
+
+def _rgb_to_hex(rgb: tuple[float, float, float]) -> str:
+    return "#" + "".join(f"{max(0, min(255, round(c * 255))):02x}" for c in rgb)
+
+
+def adjust_lightness(hex_color: str, factor: float) -> str:
+    """factor > 1 lightens, < 1 darkens, applied on the HSL lightness channel."""
+    r, g, b = _hex_to_rgb(hex_color)
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    l = max(0.0, min(1.0, l * factor))
+    return _rgb_to_hex(colorsys.hls_to_rgb(h, l, s))
+
+
+def rotate_hue(hex_color: str, degrees: float) -> str:
+    """Shift hue by `degrees`, keeping lightness/saturation — used to derive
+    the gradient's second color from the single accent the user picks."""
+    r, g, b = _hex_to_rgb(hex_color)
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
+    h = (h + degrees / 360.0) % 1.0
+    return _rgb_to_hex(colorsys.hls_to_rgb(h, l, s))
+
+
+def is_valid_hex_color(value: str) -> bool:
+    return bool(re.fullmatch(r"#[0-9a-fA-F]{6}", value or ""))
+
+
+THEME_CACHE_DIR = Path(tempfile.gettempdir()) / "ripped_ripper_theme"
+
+
+def triangle_arrow_path(hex_color: str, direction: str) -> str:
+    """
+    Writes a small solid-color triangle SVG to a cache file and returns its
+    path, for QComboBox/QSpinBox arrow glyphs.
+
+    Two things about Qt's QSS learned the hard way here: the usual CSS
+    zero-size-element-plus-one-colored-border trick for drawing a triangle
+    does NOT render correctly in Qt's style engine (it painted a filled
+    square instead) — so an actual image is needed. And Qt's QSS `url()`
+    only resolves real file paths / Qt resource paths, NOT `data:` URIs like
+    browser CSS accepts — an inline data URI silently failed to render at
+    all. Hence writing an actual file rather than embedding one inline.
+    """
+    points = "1,3 9,3 5,8" if direction == "down" else "1,7 9,7 5,2"
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">'
+        f'<polygon points="{points}" fill="{hex_color}"/></svg>'
+    )
+    THEME_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    filename = f"arrow_{direction}_{hex_color.lstrip('#')}.svg"
+    path = THEME_CACHE_DIR / filename
+    if not path.exists():
+        path.write_text(svg)
+    return path.as_posix()
+
+
+STYLE_TEMPLATE = Template("""
 * {
     font-family: -apple-system, 'SF Pro Display', 'Segoe UI', Arial, sans-serif;
-    font-size: 14px;
+    font-size: ${fs_base}px;
 }
 
 QMainWindow {
@@ -316,6 +396,12 @@ QWidget {
 
 QWidget#root_bg {
     background-color: #0a0a0f;
+}
+
+QLabel#appTitle {
+    color: $accent_light;
+    letter-spacing: -0.5px;
+    background: transparent;
 }
 
 /* ── Tabs ── */
@@ -339,16 +425,16 @@ QTabBar::tab {
     border-bottom: none;
     border-radius: 10px 10px 0 0;
     margin-right: 6px;
-    font-size: 13px;
+    font-size: ${fs_md}px;
     font-weight: 600;
 }
 QTabBar::tab:selected {
     background: #13131f;
-    color: #8b5cf6;
+    color: $accent;
     border-color: #1e1e2f;
 }
 QTabBar::tab:hover:!selected {
-    color: #a78bfa;
+    color: $accent_light;
     background: #1c1c2e;
 }
 
@@ -359,11 +445,11 @@ QLineEdit {
     border-radius: 12px;
     padding: 12px 18px;
     color: #f8fafc;
-    font-size: 14px;
-    selection-background-color: #7c3aed;
+    font-size: ${fs_base}px;
+    selection-background-color: $accent_dark;
 }
 QLineEdit:focus {
-    border-color: #8b5cf6;
+    border-color: $accent;
     background-color: #1e1e36;
 }
 QLineEdit::placeholder {
@@ -372,20 +458,20 @@ QLineEdit::placeholder {
 
 /* ── Buttons ── */
 QPushButton {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #8b5cf6, stop:1 #6366f1);
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 $accent, stop:1 $accent2);
     color: white;
     border: none;
     border-radius: 12px;
     padding: 10px 24px;
-    font-size: 13px;
+    font-size: ${fs_md}px;
     font-weight: 700;
     letter-spacing: 0.5px;
 }
 QPushButton:hover {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #a78bfa, stop:1 #818cf8);
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 $accent_light, stop:1 $accent2_light);
 }
 QPushButton:pressed {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #7c3aed, stop:1 #4f46e5);
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 $accent_dark, stop:1 $accent2_dark);
 }
 QPushButton:disabled {
     background: #1e1e2f;
@@ -394,12 +480,12 @@ QPushButton:disabled {
 QPushButton#ghost {
     background: transparent;
     border: 1px solid #2d2d44;
-    color: #818cf8;
+    color: $accent2_light;
 }
 QPushButton#ghost:hover {
-    border-color: #8b5cf6;
+    border-color: $accent;
     background: #1a1a2e;
-    color: #a78bfa;
+    color: $accent_light;
 }
 QPushButton#ghost:disabled {
     background: transparent;
@@ -414,7 +500,7 @@ QFrame#card {
     border-radius: 12px;
 }
 QFrame#card:hover {
-    border-color: #4f46e5;
+    border-color: $accent2_dark;
     background-color: #1e1e36;
 }
 
@@ -450,15 +536,25 @@ QProgressBar {
     text-align: center;
 }
 QProgressBar::chunk {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #8b5cf6, stop:1 #3b82f6);
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 $accent, stop:1 $accent2);
     border-radius: 4px;
+}
+QLabel#progressLabel {
+    color: $accent_light;
+    font-size: ${fs_base}px;
+    font-weight: 700;
+}
+QLabel#accentText {
+    color: $accent_light;
+    font-size: ${fs_sm}px;
+    background: transparent;
 }
 
 /* ── Checkboxes ── */
 QCheckBox {
     color: #94a3b8;
     spacing: 10px;
-    font-size: 13px;
+    font-size: ${fs_md}px;
 }
 QCheckBox::indicator {
     width: 18px;
@@ -468,8 +564,8 @@ QCheckBox::indicator {
     background: #1a1a2e;
 }
 QCheckBox::indicator:checked {
-    background: #8b5cf6;
-    border-color: #8b5cf6;
+    background: $accent;
+    border-color: $accent;
     image: none;
 }
 QCheckBox::indicator:disabled {
@@ -484,12 +580,15 @@ QComboBox {
     border-radius: 10px;
     padding: 6px 12px;
     color: #dde1f0;
-    font-size: 12px;
+    font-size: ${fs_sm}px;
     font-weight: 700;
     min-width: 76px;
+    /* Without this, Fusion draws a dotted keyboard-focus rectangle inside
+       the closed box — the "odd artifact" visible before you interact with it. */
+    outline: none;
 }
 QComboBox:hover {
-    border-color: #8b5cf6;
+    border-color: $accent;
     background-color: #1e1e36;
 }
 QComboBox::drop-down {
@@ -497,10 +596,9 @@ QComboBox::drop-down {
     width: 22px;
 }
 QComboBox::down-arrow {
-    image: none;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 5px solid #818cf8;
+    image: url($down_arrow_uri);
+    width: 10px;
+    height: 10px;
     margin-right: 10px;
 }
 QComboBox QAbstractItemView {
@@ -510,8 +608,80 @@ QComboBox QAbstractItemView {
     color: #dde1f0;
     padding: 4px;
     outline: none;
-    selection-background-color: #7c3aed;
+    selection-background-color: $accent_dark;
     selection-color: #ffffff;
+}
+
+/* ── Sliders (Settings tab) ── */
+QSlider::groove:horizontal {
+    height: 4px;
+    background: #2d2d44;
+    border-radius: 2px;
+}
+QSlider::handle:horizontal {
+    width: 16px;
+    height: 16px;
+    margin: -6px 0;
+    border-radius: 8px;
+    background: $accent;
+}
+QSlider::sub-page:horizontal {
+    background: $accent;
+    border-radius: 2px;
+}
+
+/* ── Spin boxes (Settings tab) ── */
+QSpinBox {
+    background-color: #1a1a2e;
+    border: 1px solid #2d2d44;
+    border-radius: 10px;
+    /* Right padding clears room for the up/down buttons below so the number
+       doesn't sit underneath them. */
+    padding: 6px 26px 6px 10px;
+    color: #dde1f0;
+    font-size: ${fs_sm}px;
+}
+QSpinBox:hover {
+    border-color: $accent;
+}
+/* Styling the box at all suppresses Qt's native-drawn spin buttons, so they
+   have to be redrawn explicitly here or the box is left with no visible
+   up/down control at all. */
+QSpinBox::up-button, QSpinBox::down-button {
+    width: 18px;
+    border: none;
+    background: #232338;
+}
+QSpinBox::up-button {
+    subcontrol-origin: border;
+    subcontrol-position: top right;
+    border-top-right-radius: 10px;
+    margin: 1px 1px 0 0;
+}
+QSpinBox::down-button {
+    subcontrol-origin: border;
+    subcontrol-position: bottom right;
+    border-bottom-right-radius: 10px;
+    margin: 0 1px 1px 0;
+}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+    background: #2d2d44;
+}
+QSpinBox::up-arrow {
+    image: url($up_arrow_uri);
+    width: 8px;
+    height: 8px;
+}
+QSpinBox::down-arrow {
+    image: url($down_arrow_uri);
+    width: 8px;
+    height: 8px;
+}
+QSpinBox::up-arrow:disabled, QSpinBox::up-arrow:off {
+    image: url($disabled_up_arrow_uri);
+}
+QSpinBox::down-arrow:disabled, QSpinBox::down-arrow:off {
+    image: url($disabled_down_arrow_uri);
 }
 
 /* ── Console ── */
@@ -519,12 +689,83 @@ QTextEdit#console {
     background-color: #05050a;
     color: #10b981;
     font-family: "Menlo", "Consolas", monospace;
-    font-size: 12px;
+    font-size: ${fs_sm}px;
     border: 1px solid #1e1e2f;
     border-radius: 8px;
     padding: 10px;
 }
-"""
+""")
+
+
+def build_stylesheet(accent: str, font_scale: float) -> str:
+    if not is_valid_hex_color(accent):
+        accent = DEFAULT_ACCENT
+    font_scale = max(0.8, min(1.4, font_scale))
+    arrow_color = adjust_lightness(rotate_hue(accent, -20), 1.22)  # == accent2_light
+
+    return STYLE_TEMPLATE.substitute(
+        accent=accent,
+        accent_light=adjust_lightness(accent, 1.22),
+        accent_dark=adjust_lightness(accent, 0.82),
+        accent2=rotate_hue(accent, -20),
+        accent2_light=arrow_color,
+        accent2_dark=adjust_lightness(rotate_hue(accent, -20), 0.82),
+        fs_base=round(14 * font_scale),
+        fs_md=round(13 * font_scale),
+        fs_sm=round(12 * font_scale),
+        down_arrow_uri=triangle_arrow_path(arrow_color, "down"),
+        up_arrow_uri=triangle_arrow_path(arrow_color, "up"),
+        disabled_down_arrow_uri=triangle_arrow_path("#334155", "down"),
+        disabled_up_arrow_uri=triangle_arrow_path("#334155", "up"),
+    )
+
+
+class AppearanceSettings(QObject):
+    """
+    App-wide accent color + text size, persisted via QSettings. Both Settings-
+    tab controls and anything else wanting to react to a live theme change
+    (there's currently just the one Settings tab, but this mirrors the
+    FormatSetting pattern used for output format) listen on `changed`.
+    """
+    changed = pyqtSignal(str, float)   # (accent_hex, font_scale)
+
+    def __init__(self) -> None:
+        super().__init__()
+        settings = QSettings("RippedRipper", "RipperGUI")
+        accent = settings.value("accent_color", DEFAULT_ACCENT)
+        self._accent = accent if is_valid_hex_color(accent) else DEFAULT_ACCENT
+        try:
+            self._font_scale = float(settings.value("font_scale", DEFAULT_FONT_SCALE))
+        except (TypeError, ValueError):
+            self._font_scale = DEFAULT_FONT_SCALE
+
+    def accent(self) -> str:
+        return self._accent
+
+    def font_scale(self) -> float:
+        return self._font_scale
+
+    def apply(self, accent: str | None = None, font_scale: float | None = None) -> None:
+        if accent is not None and is_valid_hex_color(accent):
+            self._accent = accent
+        if font_scale is not None:
+            self._font_scale = max(0.8, min(1.4, font_scale))
+
+        settings = QSettings("RippedRipper", "RipperGUI")
+        settings.setValue("accent_color", self._accent)
+        settings.setValue("font_scale", self._font_scale)
+
+        stylesheet = build_stylesheet(self._accent, self._font_scale)
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(stylesheet)
+        self.changed.emit(self._accent, self._font_scale)
+
+    def reset(self) -> None:
+        self.apply(accent=DEFAULT_ACCENT, font_scale=DEFAULT_FONT_SCALE)
+
+
+appearance_settings = AppearanceSettings()
 
 
 # ─── Utility ─────────────────────────────────────────────────────────────────
@@ -532,6 +773,22 @@ QTextEdit#console {
 def sanitize(name: str) -> str:
     """Strip characters that are illegal in filenames."""
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip()
+
+
+def grow_with_content(widget: QWidget, min_height: int) -> None:
+    """
+    Set a floor height a widget won't shrink below, while still letting it
+    grow taller when its content needs more room (e.g. the text-size setting
+    scaled up). QPushButton/QLineEdit default to a Fixed vertical size
+    policy, under which a plain setMinimumHeight() alone still caps the
+    widget at exactly that floor instead of letting it grow to fit — this
+    also switches the vertical policy to Minimum, which is what actually
+    allows the growth.
+    """
+    widget.setMinimumHeight(min_height)
+    policy = widget.sizePolicy()
+    policy.setVerticalPolicy(QSizePolicy.Policy.Minimum)
+    widget.setSizePolicy(policy)
 
 
 _ytmusic_client: YTMusic | None = None
@@ -1101,7 +1358,7 @@ class ResultCard(QFrame):
         super().__init__(parent)
         self.result = result
         self.setObjectName("card")
-        self.setFixedHeight(72)
+        grow_with_content(self, 72)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(18, 10, 14, 10)
@@ -1134,13 +1391,13 @@ class ResultCard(QFrame):
 
         # ── Status label ────────────────────────────────────────────────────
         self._status_lbl = QLabel("")
-        self._status_lbl.setFixedWidth(88)
+        self._status_lbl.setMinimumWidth(88)
         self._status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._status_lbl.setStyleSheet("font-size: 12px; font-weight: 700; background: transparent;")
 
         # ── Rip button ──────────────────────────────────────────────────────
         self._rip_btn = QPushButton("Rip")
-        self._rip_btn.setFixedSize(100, 38)
+        self._rip_btn.setMinimumSize(100, 38)
         self._rip_btn.clicked.connect(lambda: self.download_requested.emit(self.result))
 
         layout.addLayout(info, stretch=1)
@@ -1208,7 +1465,7 @@ class TrackRow(QWidget):
         info.addWidget(artist_lbl)
 
         self._icon_lbl = QLabel("·")
-        self._icon_lbl.setFixedWidth(22)
+        self._icon_lbl.setMinimumWidth(22)
         self._icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._icon_lbl.setStyleSheet("color: #44446a; font-size: 16px; font-weight: bold; background: transparent;")
 
@@ -1278,19 +1535,19 @@ class OutputFolderRow(QWidget):
         tag.setStyleSheet("color: #64748b; font-size: 12px; font-weight: 700; background: transparent;")
 
         self._path_lbl = QLabel(str(self._dir))
-        self._path_lbl.setStyleSheet("color: #a78bfa; font-size: 12px; background: transparent;")
+        self._path_lbl.setObjectName("accentText")
         self._path_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
         choose_btn = QPushButton("Choose Folder…")
         choose_btn.setObjectName("ghost")
-        choose_btn.setFixedHeight(38)
+        grow_with_content(choose_btn, 38)
         choose_btn.clicked.connect(self._choose)
 
         fmt_tag = QLabel("Format:")
         fmt_tag.setStyleSheet("color: #64748b; font-size: 12px; font-weight: 700; background: transparent;")
 
         self._fmt_combo = QComboBox()
-        self._fmt_combo.setFixedHeight(38)
+        grow_with_content(self._fmt_combo, 38)
         self._fmt_combo.setCursor(Qt.CursorShape.PointingHandCursor)
         for key, spec in AUDIO_FORMATS.items():
             self._fmt_combo.addItem(spec["label"], key)
@@ -1360,12 +1617,12 @@ class SearchTab(QWidget):
         row = QHBoxLayout()
         self._search_input = QLineEdit()
         self._search_input.setPlaceholderText("Search for a song or artist …")
-        self._search_input.setFixedHeight(48)
+        grow_with_content(self._search_input, 48)
         self._search_input.returnPressed.connect(self._do_search)
 
         self._search_btn = QPushButton("Search")
-        self._search_btn.setFixedHeight(48)
-        self._search_btn.setFixedWidth(110)
+        grow_with_content(self._search_btn, 48)
+        self._search_btn.setMinimumWidth(110)
         self._search_btn.clicked.connect(self._do_search)
 
         row.addWidget(self._search_input, stretch=1)
@@ -1400,7 +1657,7 @@ class SearchTab(QWidget):
         # ── Bottom button ───────────────────────────────────────────────────
         open_btn = QPushButton("Open Folder")
         open_btn.setObjectName("ghost")
-        open_btn.setFixedHeight(40)
+        grow_with_content(open_btn, 40)
         open_btn.clicked.connect(self._open_folder)
         root.addWidget(open_btn)
 
@@ -1519,12 +1776,12 @@ class PlaylistTab(QWidget):
         self._url_input.setPlaceholderText(
             "Paste a Spotify or Apple Music playlist URL …"
         )
-        self._url_input.setFixedHeight(48)
+        grow_with_content(self._url_input, 48)
         self._url_input.returnPressed.connect(self._fetch_playlist)
 
         self._fetch_btn = QPushButton("Fetch")
-        self._fetch_btn.setFixedHeight(48)
-        self._fetch_btn.setFixedWidth(110)
+        grow_with_content(self._fetch_btn, 48)
+        self._fetch_btn.setMinimumWidth(110)
         self._fetch_btn.clicked.connect(self._fetch_playlist)
 
         row.addWidget(self._url_input, stretch=1)
@@ -1563,8 +1820,8 @@ class PlaylistTab(QWidget):
         self._progress_bar.hide()
 
         self._progress_lbl = QLabel("")
+        self._progress_lbl.setObjectName("progressLabel")
         self._progress_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._progress_lbl.setStyleSheet("color: #8b7cf8; font-size: 13px; font-weight: 700;")
 
         root.addWidget(self._progress_bar)
         root.addWidget(self._progress_lbl)
@@ -1572,14 +1829,14 @@ class PlaylistTab(QWidget):
         # ── Bottom row ───────────────────────────────────────────────────────
         bottom = QHBoxLayout()
         self._download_btn = QPushButton("Download Selected")
-        self._download_btn.setFixedHeight(44)
+        grow_with_content(self._download_btn, 44)
         self._download_btn.setEnabled(False)
         self._download_btn.clicked.connect(self._start_downloads)
 
         self._open_btn = QPushButton("Open Folder")
         self._open_btn.setObjectName("ghost")
-        self._open_btn.setFixedHeight(44)
-        self._open_btn.setFixedWidth(145)
+        grow_with_content(self._open_btn, 44)
+        self._open_btn.setMinimumWidth(145)
         self._open_btn.setEnabled(False)
         self._open_btn.clicked.connect(self._open_folder)
 
@@ -1738,17 +1995,248 @@ class PlaylistTab(QWidget):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
 
+class SettingsTab(QWidget):
+    """Tab 3 — appearance customization, ripping behavior, and dependency updates."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._checkers: list[UpdateChecker] = []
+        self._checkers_pending = 0
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 24, 24, 20)
+        root.setSpacing(22)
+
+        root.addLayout(self._build_appearance_section())
+        root.addLayout(self._build_ripping_section())
+        root.addLayout(self._build_updates_section())
+        root.addStretch()
+
+    # ── Shared layout helpers ───────────────────────────────────────────────
+
+    @staticmethod
+    def _section_label(text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            "color: #64748b; font-size: 12px; font-weight: bold; "
+            "text-transform: uppercase; letter-spacing: 1px; background: transparent;"
+        )
+        return lbl
+
+    @staticmethod
+    def _row_label(text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet("color: #dde1f0; font-size: 13px; background: transparent;")
+        lbl.setMinimumWidth(190)
+        return lbl
+
+    # ── Appearance ───────────────────────────────────────────────────────────
+
+    def _build_appearance_section(self) -> QVBoxLayout:
+        section = QVBoxLayout()
+        section.setSpacing(12)
+        section.addWidget(self._section_label("Appearance"))
+
+        # Accent color
+        color_row = QHBoxLayout()
+        color_row.addWidget(self._row_label("Accent color"))
+
+        self._color_swatch = QPushButton()
+        self._color_swatch.setFixedSize(38, 32)
+        self._color_swatch.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._color_swatch.clicked.connect(self._choose_color)
+
+        self._color_hex_lbl = QLabel()
+        self._color_hex_lbl.setObjectName("accentText")
+        self._refresh_color_swatch(appearance_settings.accent())
+
+        color_row.addWidget(self._color_swatch)
+        color_row.addWidget(self._color_hex_lbl)
+        color_row.addStretch()
+        section.addLayout(color_row)
+
+        # Text size
+        size_row = QHBoxLayout()
+        size_row.addWidget(self._row_label("Text size"))
+
+        self._size_slider = QSlider(Qt.Orientation.Horizontal)
+        self._size_slider.setRange(80, 140)
+        self._size_slider.setFixedWidth(180)
+        self._size_slider.setValue(round(appearance_settings.font_scale() * 100))
+        self._size_slider.valueChanged.connect(self._on_size_changed)
+
+        self._size_pct_lbl = QLabel(f"{self._size_slider.value()}%")
+        self._size_pct_lbl.setObjectName("accentText")
+        self._size_pct_lbl.setMinimumWidth(42)
+
+        size_row.addWidget(self._size_slider)
+        size_row.addWidget(self._size_pct_lbl)
+        size_row.addStretch()
+        section.addLayout(size_row)
+
+        # Reset
+        reset_row = QHBoxLayout()
+        reset_btn = QPushButton("Reset Appearance")
+        reset_btn.setObjectName("ghost")
+        grow_with_content(reset_btn, 34)
+        reset_btn.clicked.connect(self._reset_appearance)
+        reset_row.addWidget(reset_btn)
+        reset_row.addStretch()
+        section.addLayout(reset_row)
+
+        return section
+
+    def _refresh_color_swatch(self, hex_color: str) -> None:
+        self._color_swatch.setStyleSheet(
+            f"background-color: {hex_color}; border-radius: 8px; border: 1px solid #2d2d44;"
+        )
+        self._color_hex_lbl.setText(hex_color)
+
+    def _choose_color(self) -> None:
+        chosen = QColorDialog.getColor(
+            QColor(appearance_settings.accent()), self, "Choose an accent color"
+        )
+        if chosen.isValid():
+            hex_color = chosen.name()
+            appearance_settings.apply(accent=hex_color)
+            self._refresh_color_swatch(hex_color)
+
+    def _on_size_changed(self, value: int) -> None:
+        self._size_pct_lbl.setText(f"{value}%")
+        appearance_settings.apply(font_scale=value / 100)
+
+    def _reset_appearance(self) -> None:
+        appearance_settings.reset()
+        self._refresh_color_swatch(appearance_settings.accent())
+        self._size_slider.setValue(round(appearance_settings.font_scale() * 100))
+
+    # ── Ripping ──────────────────────────────────────────────────────────────
+
+    def _build_ripping_section(self) -> QVBoxLayout:
+        section = QVBoxLayout()
+        section.setSpacing(12)
+        section.addWidget(self._section_label("Ripping"))
+
+        fmt_row = QHBoxLayout()
+        fmt_row.addWidget(self._row_label("Default output format"))
+        fmt_combo = QComboBox()
+        grow_with_content(fmt_combo, 36)
+        for key, spec in AUDIO_FORMATS.items():
+            fmt_combo.addItem(spec["label"], key)
+            fmt_combo.setItemData(
+                fmt_combo.count() - 1, spec["hint"], Qt.ItemDataRole.ToolTipRole
+            )
+        fmt_combo.setCurrentIndex(fmt_combo.findData(audio_format_setting.value()))
+        fmt_combo.currentIndexChanged.connect(
+            lambda _i: audio_format_setting.set_value(fmt_combo.currentData())
+        )
+        audio_format_setting.changed.connect(
+            lambda fmt: fmt_combo.setCurrentIndex(fmt_combo.findData(fmt))
+            if fmt_combo.findData(fmt) != fmt_combo.currentIndex() else None
+        )
+        fmt_row.addWidget(fmt_combo)
+        fmt_row.addStretch()
+        section.addLayout(fmt_row)
+
+        workers_row = QHBoxLayout()
+        workers_row.addWidget(self._row_label("Max concurrent downloads"))
+        settings = QSettings("RippedRipper", "RipperGUI")
+        try:
+            current_workers = int(settings.value("max_workers", MAX_WORKERS))
+        except (TypeError, ValueError):
+            current_workers = MAX_WORKERS
+        self._workers_spin = QSpinBox()
+        self._workers_spin.setRange(1, 16)
+        self._workers_spin.setMinimumWidth(70)
+        self._workers_spin.setValue(max(1, min(16, current_workers)))
+        self._workers_spin.valueChanged.connect(self._on_workers_changed)
+        workers_row.addWidget(self._workers_spin)
+        workers_row.addStretch()
+        section.addLayout(workers_row)
+
+        return section
+
+    def _on_workers_changed(self, value: int) -> None:
+        QThreadPool.globalInstance().setMaxThreadCount(value)
+        QSettings("RippedRipper", "RipperGUI").setValue("max_workers", value)
+        log(f"[SETTINGS] Max concurrent downloads set to {value}")
+
+    # ── Updates ──────────────────────────────────────────────────────────────
+
+    def _build_updates_section(self) -> QVBoxLayout:
+        section = QVBoxLayout()
+        section.setSpacing(12)
+        section.addWidget(self._section_label("Dependencies"))
+
+        managed = ", ".join(p.package for p in UPDATE_POLICIES)
+        info = QLabel(f"Auto-checked once a day: {managed}")
+        info.setStyleSheet("color: #55557a; font-size: 12px; background: transparent;")
+        section.addWidget(info)
+
+        btn_row = QHBoxLayout()
+        self._check_updates_btn = QPushButton("Check for Updates Now")
+        grow_with_content(self._check_updates_btn, 36)
+        self._check_updates_btn.clicked.connect(self._check_updates_now)
+
+        open_log_btn = QPushButton("Open Log File")
+        open_log_btn.setObjectName("ghost")
+        grow_with_content(open_log_btn, 36)
+        open_log_btn.clicked.connect(self._open_log_file)
+
+        btn_row.addWidget(self._check_updates_btn)
+        btn_row.addWidget(open_log_btn)
+        btn_row.addStretch()
+        section.addLayout(btn_row)
+
+        return section
+
+    def _check_updates_now(self) -> None:
+        self._check_updates_btn.setEnabled(False)
+        self._check_updates_btn.setText("Checking...")
+        log("[SETTINGS] Manual update check requested for: "
+            + ", ".join(p.package for p in UPDATE_POLICIES))
+
+        self._checkers = [UpdateChecker(policy, force=True) for policy in UPDATE_POLICIES]
+        self._checkers_pending = len(self._checkers)
+        for checker in self._checkers:
+            checker.finished.connect(self._on_checker_finished)
+            checker.start()
+
+    def _on_checker_finished(self) -> None:
+        self._checkers_pending -= 1
+        if self._checkers_pending <= 0:
+            self._check_updates_btn.setEnabled(True)
+            self._check_updates_btn.setText("Check for Updates Now")
+
+    def _open_log_file(self) -> None:
+        log_path = BASE_DIR / "ripper_gui_launch.log"
+        if log_path.exists():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_path)))
+        else:
+            log("[SETTINGS] No log file yet — it's only created when launched "
+                "via the Desktop app, not when run directly from a terminal.")
+
+
 # ─── Main Window ──────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Ripper GUI")
-        self.setMinimumSize(920, 750)
+        # Only a small floor to stop the window collapsing to something
+        # unusable — otherwise fully resizable to whatever size is wanted.
+        # Start size is fixed at 1000x800 regardless of how it was last left;
+        # this doesn't persist across launches on purpose.
+        self.setMinimumSize(480, 400)
         self.resize(1000, 800)
 
         pool = QThreadPool.globalInstance()
-        pool.setMaxThreadCount(MAX_WORKERS)
+        saved_workers = QSettings("RippedRipper", "RipperGUI").value("max_workers", MAX_WORKERS)
+        try:
+            saved_workers = int(saved_workers)
+        except (TypeError, ValueError):
+            saved_workers = MAX_WORKERS
+        pool.setMaxThreadCount(max(1, min(16, saved_workers)))
 
         central = QWidget()
         central.setObjectName("root_bg")
@@ -1762,10 +2250,8 @@ class MainWindow(QMainWindow):
         hdr = QHBoxLayout()
 
         logo = QLabel("Ripper GUI")
+        logo.setObjectName("appTitle")
         logo.setFont(QFont("", 24, QFont.Weight.Bold))
-        logo.setStyleSheet(
-            "color: #a78bfa; letter-spacing: -0.5px; background: transparent;"
-        )
 
         hdr.addWidget(logo)
         hdr.addStretch()
@@ -1787,6 +2273,7 @@ class MainWindow(QMainWindow):
         # and renders as a stray underline in the tab label.
         tabs.addTab(SearchTab(pool),   "Search && Rip")
         tabs.addTab(PlaylistTab(pool), "Playlist Ripper")
+        tabs.addTab(SettingsTab(),     "Settings")
         splitter.addWidget(tabs)
 
         # ── Console ──────────────────────────────────────────────────────────
@@ -1829,7 +2316,7 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("Ripper GUI")
     app.setStyle("Fusion")          # consistent cross-platform base
-    app.setStyleSheet(STYLE)
+    app.setStyleSheet(build_stylesheet(appearance_settings.accent(), appearance_settings.font_scale()))
 
     win = MainWindow()
     win.show()
