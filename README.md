@@ -20,7 +20,22 @@ Automated music request and ripping toolkit for live DJ sets. Guests submit song
 - **Desktop GUI**: PyQt6
 - **Integrations**: `yt-dlp`, `ytmusicapi`, `spotdl`
 
-## Getting Started
+## Install (no setup required)
+
+Prebuilt standalone apps — Python, ffmpeg, and all dependencies included:
+
+**[⬇ Download page](https://johndtamayo.github.io/Universal-Ripper/)** · or grab a file directly from [Releases](https://github.com/JohnDTamayo/Universal-Ripper/releases/latest)
+
+| Platform | File |
+|---|---|
+| macOS (Apple Silicon) | `RippedRipper-macOS.dmg` |
+| Windows (64-bit) | `RippedRipper-Windows.zip` |
+
+These builds aren't code-signed, so the first launch needs one extra step: on macOS right-click the app → **Open** (then *System Settings → Privacy & Security → Open Anyway* if still blocked); on Windows click **More info** → **Run anyway** at the SmartScreen prompt.
+
+Rips default to `~/Music/Ripped Ripper`, changeable in-app.
+
+## Building from source
 
 ### 0. Clone
 
@@ -59,6 +74,21 @@ Share the generated Ngrok URL with your guests.
 | WAV | ~44 MB | Lossless, no metadata support |
 
 The source is YouTube Music's ~129 kbps stream, which is the quality ceiling for every option. M4A copies that stream untouched; the others re-encode it, and the lossless formats store the same lossy audio in a much larger file rather than recovering anything.
+
+## Publishing a release
+
+Installers are built by GitHub Actions ([`build-installers.yml`](.github/workflows/build-installers.yml)) — macOS and Windows each build on their own runner, since neither can cross-compile the other.
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+That builds both platforms, runs `--selftest` on each (a real download + convert inside the packaged app, so a build that can't find its own bundled ffmpeg fails CI instead of shipping), and publishes a Release with both files attached. Use **Run workflow** on the Actions tab to test a build without publishing.
+
+The download page lives in [`docs/`](docs/index.html) and is served by GitHub Pages (enable it once under *Settings → Pages → Source: main / docs*). Its buttons point at `releases/latest/download/...`, so they keep working for new versions without edits.
+
+To build locally: `pip install pyinstaller`, place static `ffmpeg`/`ffprobe` binaries in `packaging/ffmpeg_bin/`, then `pyinstaller --noconfirm --clean packaging/RippedRipper.spec`.
 
 ## Authors
 

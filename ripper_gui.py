@@ -14,6 +14,7 @@ import re
 import sys
 import json
 import time
+import shutil
 import colorsys
 import tempfile
 import threading
@@ -41,7 +42,20 @@ import yt_dlp
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 
-BASE_DIR    = Path(__file__).parent
+# True when running from a PyInstaller bundle rather than a source checkout.
+IS_FROZEN = getattr(sys, "frozen", False)
+
+if IS_FROZEN:
+    # Inside a bundle, __file__ points into a temporary extraction directory
+    # that's wiped on exit, so rips must not default there. Use a stable
+    # per-user folder instead. sys._MEIPASS is where bundled data (ffmpeg)
+    # actually lives.
+    BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    BASE_DIR   = Path.home() / "Music" / "Ripped Ripper"
+else:
+    BUNDLE_DIR = Path(__file__).parent
+    BASE_DIR   = Path(__file__).parent
+
 SEARCH_DIR  = BASE_DIR / "DJ_Search_Rips"
 PLAYLIST_DIR = BASE_DIR / "Playlist_Rips"
 MAX_WORKERS = 8
@@ -247,6 +261,16 @@ class UpdateChecker(QThread):
 
     def run(self) -> None:
         p = self._p
+
+        # A packaged build has no pip-managed site-packages to upgrade into —
+        # pip would either fail or "succeed" somewhere the frozen app never
+        # imports from. Packaged users get updates via a new app download.
+        if IS_FROZEN:
+            if self._force:
+                log(f"[UPDATE] {p.package}: packaged builds update by downloading "
+                    f"a new version of Ripped Ripper, not via pip.")
+            return
+
         settings = QSettings("RippedRipper", "RipperGUI")
         settings_key = f"update_check_{p.package}"
         today = datetime.now(timezone.utc).date().isoformat()
@@ -775,6 +799,27 @@ def sanitize(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip()
 
 
+def find_ffmpeg() -> str | None:
+    """
+    Locate ffmpeg, preferring a copy shipped inside the bundle.
+
+    A packaged build can't rely on the user having installed ffmpeg (or on
+    Homebrew being on PATH at all), so the installer ships a static build
+    alongside the app and this finds it. Falls back to PATH for source
+    checkouts, where a system ffmpeg is the normal case.
+    """
+    exe = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+
+    for candidate in (BUNDLE_DIR / exe, BUNDLE_DIR / "ffmpeg" / exe):
+        if candidate.exists():
+            return str(candidate)
+
+    return shutil.which("ffmpeg")
+
+
+FFMPEG_PATH = find_ffmpeg()
+
+
 def grow_with_content(widget: QWidget, min_height: int) -> None:
     """
     Set a floor height a widget won't shrink below, while still letting it
@@ -914,6 +959,12 @@ def build_ydl_opts(tag: str, out_template: str, audio_format: str) -> dict:
         "logger": YtdlpLogger(tag),
         "progress_hooks": [progress_hook],
     }
+
+    # Point yt-dlp at the bundled ffmpeg. Without this a packaged build would
+    # fall back to searching PATH and fail on any machine that doesn't happen
+    # to have ffmpeg installed.
+    if FFMPEG_PATH:
+        opts["ffmpeg_location"] = FFMPEG_PATH
 
     if spec.get("pp_args"):
         opts["postprocessor_args"] = {"extractaudio": spec["pp_args"]}
@@ -2312,9 +2363,53 @@ class MainWindow(QMainWindow):
 
 # ─── Entry Point ──────────────────────────────────────────────────────────────
 
+def selftest() -> int:
+    """
+    `RippedRipper --selftest` prints how the app resolved its paths and does a
+    real end-to-end rip. Exists so a packaged build can be verified from CI
+    (and by hand after downloading) without a human driving the GUI — the
+    frozen-vs-source path and ffmpeg-discovery logic differ precisely in the
+    environment that's hardest to inspect.
+    """
+    import tempfile
+
+    print(f"frozen        : {IS_FROZEN}")
+    print(f"bundle dir    : {BUNDLE_DIR}")
+    print(f"output base   : {BASE_DIR}")
+    print(f"ffmpeg        : {FFMPEG_PATH or 'NOT FOUND'}")
+
+    if not FFMPEG_PATH:
+        print("FAIL: no ffmpeg available; audio conversion would fail.")
+        return 1
+
+    out = Path(tempfile.mkdtemp())
+    result: dict[str, str] = {}
+    signals = WorkerSignals()
+    signals.finished.connect(lambda _t: result.update(status="ok"))
+    signals.failed.connect(lambda _t, e: result.update(status="fail", error=e))
+    signals.skipped.connect(lambda _t: result.update(status="skipped"))
+
+    DownloadWorker(
+        "Bn-lcvrMOlc", "Last Nite", "The Strokes", out, signals, "mp3"
+    ).run()
+
+    files = list(out.iterdir())
+    if result.get("status") == "ok" and files:
+        print(f"rip           : OK -> {files[0].name} "
+              f"({files[0].stat().st_size // 1024} KB)")
+        return 0
+
+    print(f"rip           : FAILED ({result})")
+    return 1
+
+
 def main() -> None:
     app = QApplication(sys.argv)
     app.setApplicationName("Ripper GUI")
+
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
+
     app.setStyle("Fusion")          # consistent cross-platform base
     app.setStyleSheet(build_stylesheet(appearance_settings.accent(), appearance_settings.font_scale()))
 

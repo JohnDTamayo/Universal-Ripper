@@ -42,3 +42,10 @@ Guest_Queue_Rips/
 scratch/
 .deps_installed
 .envrc
+
+# Installer build output (PyInstaller); ffmpeg_bin is fetched at build time
+build/
+dist/
+*.spec.bak
+packaging/ffmpeg_bin/
+*.dmg

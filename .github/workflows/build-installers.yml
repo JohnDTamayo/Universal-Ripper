@@ -1,0 +1,218 @@
+name: Build Installers
+
+# Builds standalone Mac + Windows apps and attaches them to a GitHub Release.
+#
+# Trigger by pushing a version tag:   git tag v1.0.0 && git push origin v1.0.0
+# Or run manually from the Actions tab (workflow_dispatch) to test the build
+# without publishing a release.
+#
+# Both jobs must run on their own OS — a Windows .exe can't be produced from a
+# macOS runner and vice versa.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed to create the release and upload assets
+
+jobs:
+  build-macos:
+    # macos-13 is Intel, macos-14 is Apple Silicon. A build only runs on the
+    # architecture it was built for, so this ships an arm64 build. Switch to
+    # macos-13 (or add it as a second matrix entry) if Intel Macs need support.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_gui.txt
+          pip install pyinstaller
+
+      - name: Fetch static ffmpeg
+        run: |
+          set -euo pipefail
+          mkdir -p packaging/ffmpeg_bin
+          cd packaging/ffmpeg_bin
+
+          # evermeet.cx publishes self-contained static macOS builds. Use the
+          # versioned URLs from its info API, NOT the /getrelease/zip shortcut:
+          # that shortcut currently returns a zip containing a file named
+          # "ffmpeg" for BOTH tools, so ffprobe silently overwrites ffmpeg and
+          # you end up shipping two copies of the wrong binary.
+          for tool in ffmpeg ffprobe; do
+            url=$(curl -fsS "https://evermeet.cx/ffmpeg/info/${tool}/release" \
+                  | python3 -c "import sys,json; print(json.load(sys.stdin)['download']['zip']['url'])")
+            echo "Downloading ${tool} from ${url}"
+            curl -fsSL -o "${tool}.zip" "${url}"
+            unzip -o "${tool}.zip"
+            rm -f "${tool}.zip"
+          done
+          chmod +x ffmpeg ffprobe
+
+          # Verify each binary is really the tool it claims to be — a wrong
+          # payload here produces a build that can't convert audio at all.
+          ./ffmpeg  -version | head -1 | grep -q '^ffmpeg version'  || { echo "ffmpeg binary is not ffmpeg"; exit 1; }
+          ./ffprobe -version | head -1 | grep -q '^ffprobe version' || { echo "ffprobe binary is not ffprobe"; exit 1; }
+          echo "Both binaries verified."
+
+      - name: Build app bundle
+        run: pyinstaller --noconfirm --clean packaging/RippedRipper.spec
+
+      - name: Verify the bundle (real end-to-end rip)
+        run: |
+          set -euo pipefail
+          test -d "dist/Ripped Ripper.app" || { echo "app bundle missing"; exit 1; }
+          test -x "dist/Ripped Ripper.app/Contents/MacOS/RippedRipper" || { echo "executable missing"; exit 1; }
+
+          # --selftest reports the frozen path/ffmpeg resolution and performs an
+          # actual download+convert. This is what catches a bundle that launches
+          # but can't find its own ffmpeg, which a file-existence check misses.
+          "dist/Ripped Ripper.app/Contents/MacOS/RippedRipper" --selftest
+
+      - name: Ad-hoc sign
+        run: |
+          # Not a real Developer ID signature (that needs a paid Apple account),
+          # but it gives the bundle a stable identity, which macOS requires for
+          # consistent Files & Folders permission handling.
+          codesign --force --deep -s - "dist/Ripped Ripper.app"
+
+      - name: Package as DMG
+        run: |
+          mkdir -p dmg_staging
+          cp -R "dist/Ripped Ripper.app" dmg_staging/
+          # Symlink so the DMG window offers the usual drag-to-Applications flow
+          ln -s /Applications dmg_staging/Applications
+          hdiutil create -volname "Ripped Ripper" \
+            -srcfolder dmg_staging \
+            -ov -format UDZO \
+            "RippedRipper-macOS.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RippedRipper-macOS
+          path: RippedRipper-macOS.dmg
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements_gui.txt
+          pip install pyinstaller
+
+      - name: Fetch static ffmpeg
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path packaging/ffmpeg_bin | Out-Null
+
+          # yt-dlp maintains these builds specifically for use with yt-dlp.
+          # "-gpl" (not "-shared") is the statically linked variant, which is
+          # what makes it safe to ship to machines with nothing installed.
+          Invoke-WebRequest -Uri "https://github.com/yt-dlp/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -OutFile ffmpeg.zip
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg_extract -Force
+
+          foreach ($tool in @("ffmpeg.exe", "ffprobe.exe")) {
+            $found = Get-ChildItem -Path ffmpeg_extract -Recurse -Filter $tool | Select-Object -First 1
+            if (-not $found) { Write-Error "$tool not found in archive"; exit 1 }
+            Copy-Item $found.FullName -Destination packaging/ffmpeg_bin/
+          }
+
+          # Verify each binary is really the tool it claims to be.
+          $ff = & packaging/ffmpeg_bin/ffmpeg.exe -version | Select-Object -First 1
+          if ($ff -notmatch '^ffmpeg version') { Write-Error "ffmpeg binary is not ffmpeg"; exit 1 }
+          $fp = & packaging/ffmpeg_bin/ffprobe.exe -version | Select-Object -First 1
+          if ($fp -notmatch '^ffprobe version') { Write-Error "ffprobe binary is not ffprobe"; exit 1 }
+          Write-Host "Both binaries verified."
+
+      - name: Build executable
+        run: pyinstaller --noconfirm --clean packaging/RippedRipper.spec
+
+      - name: Verify the build (real end-to-end rip)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if (-not (Test-Path "dist/RippedRipper/RippedRipper.exe")) {
+            Write-Error "executable missing"; exit 1
+          }
+          if (-not (Test-Path "dist/RippedRipper/ffmpeg.exe")) {
+            Write-Error "bundled ffmpeg missing"; exit 1
+          }
+
+          # Same real download+convert check as the macOS job — catches a build
+          # that launches but can't locate its own bundled ffmpeg.
+          # The exe is built with console=False (no terminal window for users),
+          # so its stdout isn't attached here; rely on the exit code, which
+          # selftest sets to 0 only when the rip actually produced a file.
+          $proc = Start-Process -FilePath "dist/RippedRipper/RippedRipper.exe" `
+                                -ArgumentList "--selftest" `
+                                -Wait -PassThru -NoNewWindow
+          if ($proc.ExitCode -ne 0) {
+            Write-Error "selftest failed with exit code $($proc.ExitCode)"; exit 1
+          }
+          Write-Host "Selftest passed."
+
+      - name: Package as ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "dist/RippedRipper/*" -DestinationPath "RippedRipper-Windows.zip" -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RippedRipper-Windows
+          path: RippedRipper-Windows.zip
+
+  release:
+    # Only publish a release for actual version tags, not manual test runs.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-macos, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/RippedRipper-macOS/RippedRipper-macOS.dmg
+            artifacts/RippedRipper-Windows/RippedRipper-Windows.zip
+          body: |
+            ## Ripped Ripper — Download
+
+            | Platform | Download |
+            |---|---|
+            | macOS (Apple Silicon) | `RippedRipper-macOS.dmg` |
+            | Windows (64-bit) | `RippedRipper-Windows.zip` |
+
+            Everything is bundled — no Python, ffmpeg, or other setup needed.
+
+            ### First launch
+
+            These builds are **not code-signed**, so your OS will warn you the
+            first time. This is expected for indie software without a paid
+            signing certificate.
+
+            **macOS** — after dragging to Applications, right-click the app and
+            choose **Open** (don't double-click the first time), then confirm.
+            If macOS still blocks it, go to System Settings → Privacy &
+            Security and click **Open Anyway**.
+
+            **Windows** — unzip anywhere, run `RippedRipper.exe`. At the
+            SmartScreen prompt click **More info** → **Run anyway**.
