@@ -1,12 +1,10 @@
 import sqlite3
 import os
-import threading
 from fastapi import FastAPI, Request, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
-from pydantic import BaseModel
 from ytmusicapi import YTMusic
 import yt_dlp
 import asyncio

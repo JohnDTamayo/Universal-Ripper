@@ -110,6 +110,11 @@ DEFAULT_AUDIO_FORMAT = "mp3"
 # ripped in some other format.
 KNOWN_AUDIO_EXTS = tuple(AUDIO_FORMATS)
 
+# How many YouTube Music results to weigh when auto-matching a playlist track.
+# One isn't enough to avoid censored cuts; a large list just adds latency for
+# candidates that never win.
+MATCH_CANDIDATES = 5
+
 # spotdl's publicly bundled Spotify credentials (from their open-source repo)
 SPOTDL_CLIENT_ID     = "5f573c9620494bae87890c0f08a60293"
 SPOTDL_CLIENT_SECRET = "212476d9b0f3472eaa762d90b19b0ba8"
@@ -574,6 +579,18 @@ QLabel#accentText {
     background: transparent;
 }
 
+/* "E" marker on explicit tracks. Neutral grey rather than the accent colour:
+   it's a content label, not a highlight, and it has to stay legible whatever
+   accent the user picks. */
+QLabel#explicitBadge {
+    color: #c7c9d9;
+    background-color: #3a3a52;
+    border-radius: 3px;
+    font-size: ${fs_xs}px;
+    font-weight: 700;
+    padding: 1px 4px;
+}
+
 /* ── Checkboxes ── */
 QCheckBox {
     color: #94a3b8;
@@ -737,6 +754,7 @@ def build_stylesheet(accent: str, font_scale: float) -> str:
         fs_base=round(14 * font_scale),
         fs_md=round(13 * font_scale),
         fs_sm=round(12 * font_scale),
+        fs_xs=round(10 * font_scale),
         down_arrow_uri=triangle_arrow_path(arrow_color, "down"),
         up_arrow_uri=triangle_arrow_path(arrow_color, "up"),
         disabled_down_arrow_uri=triangle_arrow_path("#334155", "down"),
@@ -797,6 +815,138 @@ appearance_settings = AppearanceSettings()
 def sanitize(name: str) -> str:
     """Strip characters that are illegal in filenames."""
     return re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip()
+
+
+# ─── Track version matching ───────────────────────────────────────────────────
+#
+# YouTube Music's own "songs" ranking usually surfaces the explicit/original
+# version already, but not always, and two paths in particular go wrong:
+#
+#   * When the songs-filtered search finds nothing we fall back to an
+#     unfiltered search, which is full of `resultType: "video"` entries —
+#     live cuts, remixes, karaoke and user re-uploads — and those routinely
+#     rank above the real track.
+#   * Some tracks genuinely rank a censored cut first ("Get Low (Radio Edit)"
+#     comes back as result #1 with isExplicit=False).
+#
+# So candidates get scored rather than blindly taking results[0].
+
+# Title markers for a censored/sanitised cut.
+CLEAN_MARKERS = (
+    "clean", "censored", "radio edit", "radio version", "clean version",
+    "clean edit", "super clean", "no cursing", "edited",
+)
+
+# Title markers for re-interpretations. Avoided when auto-matching a known
+# track, since a playlist entry for "Without Me" means the studio recording,
+# not a live cut or a nightcore edit.
+VARIANT_MARKERS = (
+    "live", "remix", "cover", "karaoke", "instrumental", "acoustic",
+    "sped up", "speed up", "slowed", "nightcore", "reverb", "8d audio",
+    "tribute", "made famous by", "originally performed",
+)
+
+
+def is_explicit(item: object) -> bool | None:
+    """
+    Whether a track is flagged explicit, or None when the source doesn't say.
+
+    Covers all three sources: YouTube Music search results (`isExplicit`),
+    spotdl Songs (`explicit`) and our Apple Music SimpleSong.
+    """
+    if isinstance(item, dict):
+        return item.get("isExplicit")
+    value = getattr(item, "explicit", None)
+    return value if isinstance(value, bool) else None
+
+
+def _markers_in(title: str, markers: tuple[str, ...]) -> set[str]:
+    """
+    Which of `markers` appear in `title`, matched on word-ish boundaries so
+    "Clean" hits but "Cleaning" doesn't, and the "live" inside "Living" or
+    "Olivia" doesn't either.
+    """
+    # str() rather than a plain `or ""`: a non-string title (an upstream API
+    # change returning a number, say) would otherwise crash on .lower() and
+    # take the whole track down with it.
+    lowered = str(title or "").lower()
+    return {
+        m for m in markers
+        if re.search(rf"(?<![a-z]){re.escape(m)}(?![a-z])", lowered)
+    }
+
+
+def _contains_marker(title: str, markers: tuple[str, ...]) -> bool:
+    return bool(_markers_in(title, markers))
+
+
+def score_candidate(result: dict, source_title: str, prefer_explicit: bool) -> int:
+    """
+    Rank one YouTube Music search result as a match for a known track.
+    Higher is better; the caller takes the maximum.
+
+    Only used for *automatic* matching (playlist ripping). The Search tab
+    shows YouTube's own ordering untouched, because there the user is
+    choosing for themselves.
+    """
+    title = result.get("title") or ""
+    score = 0
+
+    # A catalogue "song" beats a "video" every time: the video results are
+    # where the live cuts and re-uploads live.
+    if result.get("resultType") == "song":
+        score += 100
+    elif result.get("resultType") == "video":
+        score -= 50
+
+    explicit = result.get("isExplicit")
+    if prefer_explicit and explicit is True:
+        score += 40
+    # An explicitly-marked clean cut is the thing we're trying to avoid.
+    if prefer_explicit and _contains_marker(title, CLEAN_MARKERS):
+        score -= 60
+
+    # Variants are judged against what the source track actually asked for: a
+    # playlist entry named "... - Live" should match the live recording, while
+    # a plain title should not. Rewarding the asked-for variant matters as much
+    # as penalising the unasked-for one — without the bonus, a candidate that
+    # matches the request merely ties with the studio cut and loses on ordering.
+    wanted = _markers_in(source_title, VARIANT_MARKERS)
+    present = _markers_in(title, VARIANT_MARKERS)
+    if wanted & present:
+        score += 35
+    if present - wanted:
+        score -= 45
+
+    return score
+
+
+def pick_best_match(
+    results: list[dict], source_title: str, prefer_explicit: bool
+) -> dict | None:
+    """
+    Choose the best candidate, preserving YouTube's ordering as the
+    tie-breaker (`max` keeps the first of equal scores).
+    """
+    usable = [r for r in results if r.get("videoId")]
+    if not usable:
+        return None
+    return max(usable, key=lambda r: score_candidate(r, source_title, prefer_explicit))
+
+
+def explicit_badge(explicit: bool | None) -> QLabel | None:
+    """
+    Small "E" marker for an explicit track, or None when the track isn't
+    explicit or the source didn't say. Returning None keeps the callers to a
+    simple `if badge:` rather than each deciding what "unknown" looks like.
+    """
+    if explicit is not True:
+        return None
+    label = QLabel("E")
+    label.setObjectName("explicitBadge")
+    label.setToolTip("Explicit")
+    label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    return label
 
 
 def find_ffmpeg() -> str | None:
@@ -1148,6 +1298,8 @@ class SimpleSong:
     """
     name: str
     artists: list = field(default_factory=list)
+    # Mirrors spotdl's own field name so is_explicit() works on either type.
+    explicit: bool | None = None
 
 
 class PlaylistFetcher(QThread):
@@ -1304,7 +1456,13 @@ class PlaylistFetcher(QThread):
                 continue
             subtitle_links = item.get("subtitleLinks") or []
             artist = subtitle_links[0]["title"] if subtitle_links else "Unknown Artist"
-            songs.append(SimpleSong(name=title, artists=[artist]))
+            # Apple Music marks explicit tracks with showExplicitBadge: True and
+            # simply omits the key otherwise, so absence means "not explicit".
+            songs.append(SimpleSong(
+                name=title,
+                artists=[artist],
+                explicit=bool(item.get("showExplicitBadge")),
+            ))
             log(f"[PLAYLIST] #{i:>3d}  {artist} - {title}")
 
         log(f"[PLAYLIST] Successfully extracted {len(songs)} tracks from playlist '{playlist_name}'.")
@@ -1360,20 +1518,34 @@ class PlaylistTrackDownloader(QRunnable):
             log(f"{tag} matching on YouTube Music...")
             yt      = ytmusic()
             query   = f"{artist} {title}"
-            results = yt.search(query, filter="songs", limit=1)
+            # Several candidates, not one: picking results[0] blindly lands on
+            # censored cuts and live/remix videos. See score_candidate().
+            results = yt.search(query, filter="songs", limit=MATCH_CANDIDATES)
             if not results:
-                results = yt.search(query, limit=1)
+                results = yt.search(query, limit=MATCH_CANDIDATES)
 
             if not results:
                 log(f"{tag} FAILED - no match on YouTube Music")
                 self.signals.failed.emit(self.track_id, "Not found on YouTube Music")
                 return
 
-            video_id = results[0].get("videoId")
-            if not video_id:
+            best = pick_best_match(results, title, prefer_explicit_setting.value())
+            if best is None:
                 log(f"{tag} FAILED - match had no video ID")
                 self.signals.failed.emit(self.track_id, "No video ID found")
                 return
+
+            video_id = best.get("videoId")
+
+            explicit_note = {True: "explicit", False: "clean"}.get(
+                best.get("isExplicit"), "rating unknown"
+            )
+            chosen_title = best.get("title") or title
+            if results[0].get("videoId") != video_id:
+                log(f"{tag} preferred '{chosen_title}' ({explicit_note}) over "
+                    f"'{results[0].get('title')}'")
+            else:
+                log(f"{tag} matched '{chosen_title}' ({explicit_note})")
 
             log(f"{tag} matched video ID {video_id} -> {self.output_dir}")
             url = f"https://music.youtube.com/watch?v={video_id}"
@@ -1437,7 +1609,16 @@ class ResultCard(QFrame):
         meta_lbl = QLabel(meta)
         meta_lbl.setStyleSheet("color: #55557a; font-size: 12px; background: transparent;")
 
-        info.addWidget(title_lbl)
+        # ── Title row, with an "E" marker on explicit tracks ────────────────
+        title_row = QHBoxLayout()
+        title_row.setSpacing(6)
+        title_row.addWidget(title_lbl)
+        badge = explicit_badge(is_explicit(result))
+        if badge:
+            title_row.addWidget(badge)
+        title_row.addStretch()
+
+        info.addLayout(title_row)
         info.addWidget(meta_lbl)
 
         # ── Status label ────────────────────────────────────────────────────
@@ -1512,7 +1693,17 @@ class TrackRow(QWidget):
         artist_lbl = QLabel(str(artist))
         artist_lbl.setStyleSheet("color: #55557a; font-size: 12px; background: transparent;")
 
-        info.addWidget(title_lbl)
+        # Explicit marker, taken from whatever the playlist source reported
+        # (Spotify's `explicit`, Apple Music's `showExplicitBadge`).
+        title_row = QHBoxLayout()
+        title_row.setSpacing(6)
+        title_row.addWidget(title_lbl)
+        badge = explicit_badge(is_explicit(song))
+        if badge:
+            title_row.addWidget(badge)
+        title_row.addStretch()
+
+        info.addLayout(title_row)
         info.addWidget(artist_lbl)
 
         self._icon_lbl = QLabel("·")
@@ -1563,6 +1754,38 @@ class FormatSetting(QObject):
 
 
 audio_format_setting = FormatSetting()
+
+
+class PreferExplicitSetting(QObject):
+    """
+    Whether automatic playlist matching should favour the explicit/original
+    cut over a censored one. On by default — a playlist entry almost always
+    means the version the artist released.
+    """
+    changed = pyqtSignal(bool)
+
+    def __init__(self) -> None:
+        super().__init__()
+        stored = QSettings("RippedRipper", "RipperGUI").value("prefer_explicit", True)
+        # QSettings round-trips booleans as the strings "true"/"false" on some
+        # backends, so normalise rather than trusting the type.
+        self._value = stored if isinstance(stored, bool) else str(stored).lower() == "true"
+
+    def value(self) -> bool:
+        return self._value
+
+    def set_value(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._value:
+            return
+        self._value = enabled
+        QSettings("RippedRipper", "RipperGUI").setValue("prefer_explicit", enabled)
+        log(f"[SETTINGS] Prefer explicit (uncensored) versions: "
+            f"{'on' if enabled else 'off'}")
+        self.changed.emit(enabled)
+
+
+prefer_explicit_setting = PreferExplicitSetting()
 
 
 class OutputFolderRow(QWidget):
@@ -2204,6 +2427,20 @@ class SettingsTab(QWidget):
         workers_row.addWidget(self._workers_spin)
         workers_row.addStretch()
         section.addLayout(workers_row)
+
+        explicit_row = QHBoxLayout()
+        explicit_row.addWidget(self._row_label("Track versions"))
+        self._explicit_check = QCheckBox("Prefer explicit (uncensored) versions")
+        self._explicit_check.setChecked(prefer_explicit_setting.value())
+        self._explicit_check.setToolTip(
+            "When matching playlist tracks on YouTube Music, favour the "
+            "original explicit release over a clean or radio edit."
+        )
+        self._explicit_check.toggled.connect(prefer_explicit_setting.set_value)
+        prefer_explicit_setting.changed.connect(self._explicit_check.setChecked)
+        explicit_row.addWidget(self._explicit_check)
+        explicit_row.addStretch()
+        section.addLayout(explicit_row)
 
         return section
 
