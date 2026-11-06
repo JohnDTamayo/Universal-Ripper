@@ -4,7 +4,8 @@ Ripper GUI
 ──────────
 Standalone PyQt6 desktop app for:
   • Search & Rip  — search YouTube Music, download as MP3 / M4A / FLAC / WAV
-  • Playlist Ripper — paste a Spotify or Apple Music playlist URL, download all tracks
+  • Playlist Ripper — paste a Spotify or Apple Music playlist URL, download all
+    tracks, and optionally merge them into one continuous single-file mix
 
 Dependencies: PyQt6, ytmusicapi, yt-dlp, spotdl
 Run: python ripper_gui.py
@@ -250,6 +251,16 @@ UPDATE_POLICIES = [
 ]
 
 
+# pip is not safe to run concurrently against one environment: the three
+# checkers start together, and these packages share dependencies (spotdl pulls
+# in yt-dlp), so two installs land in the same site-packages at once and one
+# deletes files the other is still unpacking. Observed in practice as
+# "[Errno 2] No such file or directory: .../yt_dlp/extractor/wikimedia.py" and a
+# bare AssertionError from the other install. The PyPI *checks* still overlap
+# freely — only the install step is serialised.
+_pip_lock = threading.Lock()
+
+
 class UpdateChecker(QThread):
     """
     Background, once-a-day-per-package check against PyPI. Installs in-place
@@ -312,11 +323,13 @@ class UpdateChecker(QThread):
 
         log(f"[UPDATE] {p.package} {installed_str} -> {latest_str} available, updating...")
         try:
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", "--upgrade",
-                 "--disable-pip-version-check", f"{p.package}=={latest_str}"],
-                capture_output=True, text=True, timeout=90,
-            )
+            with _pip_lock:
+                result = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--upgrade",
+                     "--disable-pip-version-check", f"{p.package}=={latest_str}"],
+                    capture_output=True, text=True, timeout=90,
+                    **no_console_window(),
+                )
         except Exception as exc:
             log(f"[UPDATE] {p.package} update failed to run: {exc}")
             return
@@ -880,6 +893,33 @@ def _contains_marker(title: str, markers: tuple[str, ...]) -> bool:
     return bool(_markers_in(title, markers))
 
 
+def _title_words(title: str) -> set[str]:
+    """
+    The meaningful words of a track title, for comparing two titles.
+
+    Bracketed trailers are dropped — "(Radio Edit)", "(feat. …)", "(2022
+    Remaster)" say which *version* a candidate is, which VARIANT_MARKERS and
+    CLEAN_MARKERS already judge separately, and leaving them in would make
+    every version of a song look like a slightly different song.
+    """
+    base = re.sub(r"[(\[][^)\]]*[)\]]", " ", str(title or "").lower())
+    return set(re.findall(r"[a-z0-9]+", base))
+
+
+def title_affinity(source_title: str, candidate_title: str) -> float:
+    """
+    How much of the requested title the candidate's title actually accounts
+    for, from 0.0 (nothing in common) to 1.0 (every word present).
+
+    A title with nothing left after normalising gives 1.0: no signal either
+    way is not evidence against a candidate.
+    """
+    wanted = _title_words(source_title)
+    if not wanted:
+        return 1.0
+    return len(wanted & _title_words(candidate_title)) / len(wanted)
+
+
 def score_candidate(result: dict, source_title: str, prefer_explicit: bool) -> int:
     """
     Rank one YouTube Music search result as a match for a known track.
@@ -891,6 +931,15 @@ def score_candidate(result: dict, source_title: str, prefer_explicit: bool) -> i
     """
     title = result.get("title") or ""
     score = 0
+
+    # Is this even the same song? This has to dominate every other term. With
+    # only the signals below, a *different* track that happens to be flagged
+    # explicit beat the correct clean one on the +40 alone — searching for the
+    # Strokes' "Last Nite" really did come back with "Lonely in the Future",
+    # which then got saved under the requested track's filename. Weighted above
+    # the other bonuses put together, so version preferences can only ever
+    # choose *between* cuts of the right song.
+    score += int(title_affinity(source_title, title) * 240)
 
     # A catalogue "song" beats a "video" every time: the video results are
     # where the live cuts and re-uploads live.
@@ -960,14 +1009,36 @@ def find_ffmpeg() -> str | None:
     """
     exe = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
 
+    # is_file(), not exists(): the second candidate's parent is itself named
+    # "ffmpeg", so on a layout that stages the tools in that subfolder the
+    # first candidate matches the *directory* and hands back a path yt-dlp
+    # can't execute — a silent failure of every conversion.
     for candidate in (BUNDLE_DIR / exe, BUNDLE_DIR / "ffmpeg" / exe):
-        if candidate.exists():
+        if candidate.is_file():
             return str(candidate)
 
     return shutil.which("ffmpeg")
 
 
-FFMPEG_PATH = find_ffmpeg()
+def find_ffprobe() -> str | None:
+    """
+    Locate ffprobe, which ships beside ffmpeg in the same static build.
+
+    Only needed to time the tracks going into a continuous mix (for the cue
+    sheet and tracklist timestamps), so a missing ffprobe degrades the mix's
+    sidecar files rather than blocking the merge itself.
+    """
+    exe = "ffprobe.exe" if sys.platform == "win32" else "ffprobe"
+
+    for candidate in (BUNDLE_DIR / exe, BUNDLE_DIR / "ffmpeg" / exe):
+        if candidate.is_file():        # not exists() — see find_ffmpeg()
+            return str(candidate)
+
+    return shutil.which("ffprobe")
+
+
+FFMPEG_PATH  = find_ffmpeg()
+FFPROBE_PATH = find_ffprobe()
 
 
 def grow_with_content(widget: QWidget, min_height: int) -> None:
@@ -1194,6 +1265,478 @@ def other_format_rips(output_dir: Path, stem: str, audio_format: str) -> list[Pa
         if ext != audio_format and (p := output_dir / f"{stem}.{ext}").exists()
     ]
 
+
+# ─── Continuous mix ───────────────────────────────────────────────────────────
+#
+# A playlist can also come down as a single file: every track concatenated in
+# playlist order, so it can be dropped on a deck (or in a car stereo) and played
+# start to finish without ever cueing up the next track.
+#
+# The merge runs *after* the individual rips land, reading them back off disk
+# rather than tapping the download stream. That keeps the per-track files the
+# source of truth — a mix can be rebuilt, or rebuilt in another format, without
+# re-downloading anything — and means a batch where some tracks failed still
+# produces a mix of the ones that worked.
+
+MIX_SUFFIX = " (Full Mix)"
+
+# Re-encode arguments per output format. ffmpeg's concat demuxer can only
+# stream-copy when every input shares one codec, sample rate and channel layout;
+# re-encoding to an explicit 44.1kHz stereo target instead guarantees one valid
+# continuous stream even when a track came back at 48kHz or in mono.
+MIX_ENCODE_ARGS: dict[str, list[str]] = {
+    "mp3":  ["-c:a", "libmp3lame", "-b:a", "320k", "-ar", "44100", "-ac", "2"],
+    "m4a":  ["-c:a", "aac", "-b:a", "256k", "-ar", "44100", "-ac", "2"],
+    "flac": ["-c:a", "flac", "-sample_fmt", "s16", "-ar", "44100", "-ac", "2"],
+    "wav":  ["-c:a", "pcm_s16le", "-ar", "44100", "-ac", "2"],
+}
+
+# The muxer each format needs, named explicitly because the merge writes to a
+# ".part" file first (so a failed merge can't leave a half-written mix looking
+# finished) and ffmpeg can't infer a container from that extension. Note that
+# m4a is written by the "ipod" muxer, not "mp4".
+MIX_MUXERS = {"mp3": "mp3", "m4a": "ipod", "flac": "flac", "wav": "wav"}
+
+# Cue sheets only recognise a handful of FILE types; anything that isn't MP3 is
+# conventionally declared WAVE, which DJ software reads regardless of what the
+# container actually is.
+CUE_FILE_TYPES = {"mp3": "MP3", "wav": "WAVE", "flac": "WAVE", "m4a": "WAVE"}
+
+# WAV keeps its chunk sizes in 32-bit fields, so the format itself tops out just
+# under 4 GiB — about 6.7 hours of 44.1kHz/16-bit stereo. A longer mix would be
+# silently truncated, so it gets a warning instead.
+WAV_MAX_BYTES     = 4 * 1024 ** 3
+WAV_BYTES_PER_SEC = 44100 * 2 * 2
+
+# Keys ffmpeg's `-progress` writer emits that carry no error information, so
+# they're dropped instead of being mistaken for diagnostics.
+FFMPEG_PROGRESS_KEYS = frozenset({
+    "bitrate", "total_size", "out_time_us", "out_time_ms", "out_time",
+    "dup_frames", "drop_frames", "speed", "progress", "frame", "fps", "size",
+})
+
+
+def song_artist_title(song: object) -> tuple[str, str]:
+    """
+    (artist, title) for a playlist entry, from either playlist source.
+
+    spotdl hands back `artists` as a list of names, our Apple Music SimpleSong
+    mirrors that shape, and either can carry a non-str entry — so this is the
+    single place that flattens it. The downloader uses it to name the file and
+    the mix builder uses it to find that same file again, so the two must not be
+    allowed to drift apart.
+    """
+    title   = str(getattr(song, "name", "") or "Unknown Title")
+    artists = getattr(song, "artists", None) or ["Unknown"]
+    first   = artists[0] if artists else "Unknown"
+    artist  = first if isinstance(first, str) else str(first)
+    return (artist or "Unknown"), title
+
+
+def track_stem(artist: str, title: str) -> str:
+    """Filename stem (no extension) that a playlist track is ripped to."""
+    return f"{sanitize(artist)} - {sanitize(title)}"
+
+
+def no_console_window() -> dict:
+    """
+    Popen/run kwargs that stop a child process flashing a console window on
+    Windows. The packaged build runs windowed, so without this every ffmpeg and
+    ffprobe call would pop a black box on screen.
+    """
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
+
+
+def probe_duration(path: Path) -> float | None:
+    """Length of an audio file in seconds, or None if ffprobe can't say."""
+    if not FFPROBE_PATH:
+        return None
+    try:
+        result = subprocess.run(
+            [FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nokey=1:noprint_wrappers=1", str(path)],
+            capture_output=True, text=True, timeout=30, **no_console_window(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(f"[MIX] could not read the length of {path.name}: {exc}")
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        seconds = float((result.stdout or "").strip())
+    except ValueError:
+        return None
+    return seconds if seconds > 0 else None
+
+
+def parse_ffmpeg_time(value: str) -> float | None:
+    """
+    Seconds from ffmpeg's HH:MM:SS.ffffff progress timestamp.
+
+    Parsed in preference to the `out_time_us`/`out_time_ms` keys beside it:
+    those two have historically disagreed about their own unit, while this one
+    is unambiguous. Reads "N/A", emitted before the first frame, as unknown.
+    """
+    parts = value.strip().split(":")
+    if len(parts) != 3:
+        return None
+    try:
+        hours, minutes, seconds = (float(part) for part in parts)
+    except ValueError:
+        return None
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def format_cue_time(seconds: float) -> str:
+    """MM:SS:FF at 75 frames per second — the cue-sheet INDEX format."""
+    total_frames = int(round(max(0.0, seconds) * 75))
+    minutes, rem = divmod(total_frames, 75 * 60)
+    secs, frames = divmod(rem, 75)
+    return f"{minutes:02d}:{secs:02d}:{frames:02d}"
+
+
+def format_clock(seconds: float) -> str:
+    """H:MM:SS, or M:SS under an hour — the tracklist timestamp format."""
+    total         = int(max(0.0, seconds))
+    hours, rem    = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def cue_quote(value: str) -> str:
+    """
+    Make a string safe inside a cue sheet's double quotes.
+
+    Cue syntax has no escape mechanism at all, so an apostrophe stands in for a
+    quote mark and newlines are flattened — otherwise a single track title
+    containing a quote breaks every entry after it.
+    """
+    flat = value.replace('"', "'")
+    return " ".join(flat.split())
+
+
+@dataclass
+class MixEntry:
+    """One track of a continuous mix, in playlist order."""
+    path:     Path
+    artist:   str
+    title:    str
+    duration: float | None = None
+
+
+def write_mix_sidecars(
+    mix_path:     Path,
+    mix_title:    str,
+    entries:      list[MixEntry],
+    audio_format: str,
+) -> list[Path]:
+    """
+    Write the cue sheet and plain tracklist that sit beside a finished mix.
+
+    Without them the mix is one opaque hour of audio: the .cue gives DJ software
+    real track markers to skip between, and the .txt is the timestamped list
+    that gets pasted into a Mixcloud or SoundCloud description. Both need every
+    track's length, so both are skipped when any duration couldn't be read.
+    """
+    if not entries or any(entry.duration is None for entry in entries):
+        log("[MIX] track lengths unavailable - skipping cue sheet and tracklist")
+        return []
+
+    cue_lines = [
+        f'TITLE "{cue_quote(mix_title)}"',
+        'PERFORMER "Various Artists"',
+        f'FILE "{cue_quote(mix_path.name)}" '
+        f'{CUE_FILE_TYPES.get(audio_format, "WAVE")}',
+    ]
+    heading  = cue_quote(mix_title) or "Playlist"
+    txt_lines = [heading, "=" * len(heading), ""]
+
+    offset = 0.0
+    for number, entry in enumerate(entries, start=1):
+        cue_lines += [
+            f"  TRACK {number:02d} AUDIO",
+            f'    TITLE "{cue_quote(entry.title)}"',
+            f'    PERFORMER "{cue_quote(entry.artist)}"',
+            f"    INDEX 01 {format_cue_time(offset)}",
+        ]
+        txt_lines.append(
+            f"{number:>3d}. {format_clock(offset)}  {entry.artist} - {entry.title}"
+        )
+        offset += entry.duration or 0.0
+
+    txt_lines += ["", f"{len(entries)} tracks  ·  {format_clock(offset)} total"]
+
+    written: list[Path] = []
+    for path, lines in (
+        (mix_path.with_suffix(".cue"), cue_lines),
+        (mix_path.with_suffix(".txt"), txt_lines),
+    ):
+        try:
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            written.append(path)
+        except OSError as exc:
+            log(f"[MIX] could not write {path.name}: {exc}")
+    return written
+
+
+class MixBuilder(QThread):
+    """
+    Concatenates already-ripped tracks into one continuous file with ffmpeg.
+
+    Runs on its own QThread rather than the download pool: it is a single long
+    ffmpeg pass that can't start until every track has landed, so holding a pool
+    slot for it would stall the next batch behind a job that is only waiting.
+    """
+
+    # percent, or -1 while the total length isn't known yet
+    progress  = pyqtSignal(int, str)
+    completed = pyqtSignal(str, int)    # (mix file path, tracks merged)
+    error     = pyqtSignal(str)
+
+    def __init__(
+        self,
+        entries:      list[MixEntry],
+        mix_path:     Path,
+        mix_title:    str,
+        audio_format: str,
+    ) -> None:
+        super().__init__()
+        self.entries      = entries
+        self.mix_path     = mix_path
+        self.mix_title    = mix_title
+        self.audio_format = audio_format
+        self._proc: subprocess.Popen | None = None
+        self._cancelled   = False
+
+    # ── Control ──────────────────────────────────────────────────────────────
+
+    def cancel(self) -> None:
+        """
+        Ask the merge to stop. Safe to call from the GUI thread, and never
+        blocks there: this only raises the flag and sends the polite signal.
+        The merge thread itself notices, escalates if needed, and cleans up.
+        """
+        self._cancelled = True
+        self.requestInterruption()
+        proc = self._proc
+        if proc is not None:
+            try:
+                proc.terminate()
+            except OSError as exc:
+                log(f"[MIX] could not signal ffmpeg: {exc}")
+
+    def _stopping(self) -> bool:
+        return self._cancelled or self.isInterruptionRequested()
+
+    def _stop_proc(self, grace: float = 3.0) -> None:
+        """
+        Make ffmpeg actually stop, from the merge thread.
+
+        SIGTERM on its own is not enough here: with the concat demuxer ffmpeg
+        defers the signal and encodes the entire playlist out before acting on
+        it — measured at the full run length, so cancelling a two-hour mix would
+        otherwise keep the app busy for minutes. The polite request gets a few
+        seconds and then the process is killed outright. The half-written .part
+        file is thrown away either way, so there is nothing to lose by being
+        abrupt about it.
+        """
+        proc = self._proc
+        if proc is None:
+            return
+        self._proc = None
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                log("[MIX] ffmpeg did not stop when asked - killing it")
+                proc.kill()
+                proc.wait(timeout=5)
+        except OSError as exc:
+            log(f"[MIX] could not stop ffmpeg: {exc}")
+        finally:
+            if proc.stdout is not None:
+                try:
+                    proc.stdout.close()
+                except OSError:
+                    pass
+
+    # ── Build ────────────────────────────────────────────────────────────────
+
+    def run(self) -> None:
+        started = time.monotonic()
+        try:
+            self._build()
+        except Exception as exc:
+            log(f"[MIX] FAILED after {time.monotonic() - started:.1f}s - {exc}")
+            self.error.emit(str(exc))
+
+    def _build(self) -> None:
+        if not FFMPEG_PATH:
+            raise RuntimeError("ffmpeg not found - cannot build a mix")
+
+        # A track whose rip failed has no file; merging around it beats refusing
+        # to build the mix at all.
+        entries = [entry for entry in self.entries if entry.path.exists()]
+        absent  = len(self.entries) - len(entries)
+        if absent:
+            log(f"[MIX] {absent} track(s) not on disk - leaving them out")
+        if not entries:
+            raise RuntimeError("none of the tracks are on disk")
+
+        self.progress.emit(-1, f"Timing {len(entries)} tracks …")
+        for entry in entries:
+            if self._stopping():
+                return
+            entry.duration = probe_duration(entry.path)
+
+        timed      = [entry.duration for entry in entries if entry.duration]
+        total_secs = sum(timed) if len(timed) == len(entries) else 0.0
+        length     = f" (~{format_clock(total_secs)})" if total_secs else ""
+        log(f"[MIX] merging {len(entries)} tracks{length} -> {self.mix_path.name}")
+
+        if (self.audio_format == "wav"
+                and total_secs * WAV_BYTES_PER_SEC > WAV_MAX_BYTES):
+            log("[MIX] warning: a WAV mix this long passes the 4 GB ceiling the "
+                "WAV format itself has and will be truncated - FLAC holds it "
+                "losslessly, MP3 far more compactly")
+
+        self.mix_path.parent.mkdir(parents=True, exist_ok=True)
+        part_path = self.mix_path.with_name(self.mix_path.name + ".part")
+        list_dir  = Path(tempfile.mkdtemp(prefix="rr_mix_"))
+        try:
+            # The track list goes in a file rather than on the command line: a
+            # 200-track playlist would overrun the OS argument-length limit.
+            list_file = list_dir / "tracks.txt"
+            list_file.write_text(
+                "".join(f"file '{self._quote(entry.path)}'\n" for entry in entries),
+                encoding="utf-8",
+            )
+            self._run_ffmpeg(list_file, part_path, total_secs, len(entries))
+        finally:
+            shutil.rmtree(list_dir, ignore_errors=True)
+
+        if self._stopping():
+            part_path.unlink(missing_ok=True)
+            log("[MIX] cancelled")
+            return
+
+        # Same directory as the final file, so this is an atomic rename: the mix
+        # appears complete or not at all, never half-written.
+        part_path.replace(self.mix_path)
+
+        for sidecar in write_mix_sidecars(
+            self.mix_path, self.mix_title, entries, self.audio_format
+        ):
+            log(f"[MIX] wrote {sidecar.name}")
+
+        self.completed.emit(str(self.mix_path), len(entries))
+
+    @staticmethod
+    def _quote(path: Path) -> str:
+        """
+        Quote a path for ffmpeg's concat list, which reads single-quoted
+        strings: a literal apostrophe has to close the quote, escape itself and
+        reopen. Plenty of tracks need it ("Don't Stop Believin'").
+        """
+        return str(path.resolve()).replace("'", "'\\''")
+
+    def _run_ffmpeg(
+        self,
+        list_file:  Path,
+        out_path:   Path,
+        total_secs: float,
+        count:      int,
+    ) -> None:
+        encode_args = MIX_ENCODE_ARGS.get(
+            self.audio_format, MIX_ENCODE_ARGS[DEFAULT_AUDIO_FORMAT]
+        )
+        cmd = [
+            FFMPEG_PATH, "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+            "-f", "concat", "-safe", "0", "-i", str(list_file),
+            # Audio only. Cover art rides along as a video stream on some rips
+            # and not others, and a stream that appears partway through a concat
+            # aborts the whole merge.
+            "-map", "0:a", "-vn", "-dn", "-sn",
+            # Drop the first track's tags, then label the mix as itself —
+            # otherwise the whole file inherits track one's title and artwork.
+            "-map_metadata", "-1",
+            *encode_args,
+            "-metadata", f"title={self.mix_title}",
+            "-metadata", "artist=Various Artists",
+            "-f", MIX_MUXERS.get(self.audio_format, "mp3"),
+            "-progress", "pipe:1", "-nostats",
+            str(out_path),
+        ]
+
+        try:
+            self._proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, bufsize=1, **no_console_window(),
+            )
+        except OSError as exc:
+            raise RuntimeError(f"could not start ffmpeg: {exc}") from exc
+
+        if total_secs <= 0:
+            self.progress.emit(-1, f"Merging {count} tracks …")
+
+        tail: list[str] = []
+        last_pct = -1
+        stream   = self._proc.stdout
+        if stream is not None:
+            for raw in stream:
+                # Checked per line rather than only at the end: ffmpeg keeps
+                # emitting progress right through a deferred SIGTERM, so
+                # without this the loop would run to the end of the encode.
+                if self._stopping():
+                    break
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith("out_time="):
+                    done = parse_ffmpeg_time(line.split("=", 1)[1])
+                    if done is not None and total_secs > 0:
+                        # Capped at 99: the final chunk and the muxer flush
+                        # aren't accounted for, so a 100% here would just sit
+                        # there looking stuck.
+                        pct = max(0, min(99, int(done * 100 / total_secs)))
+                        if pct >= last_pct + 5:
+                            last_pct = pct
+                            self.progress.emit(pct, f"Merging mix … {pct}%")
+                    continue
+                key = line.split("=", 1)[0] if "=" in line else ""
+                if key in FFMPEG_PROGRESS_KEYS or key.startswith("stream_"):
+                    continue
+                # Anything else on the stream is an ffmpeg diagnostic; keep the
+                # last few so a failure can report something more useful than a
+                # numeric exit code.
+                tail.append(line)
+                del tail[:-5]
+
+        if self._stopping():
+            self._stop_proc()
+            return
+
+        returncode = self._proc.wait()
+        self._proc = None
+
+        if returncode != 0:
+            out_path.unlink(missing_ok=True)
+            raise RuntimeError(tail[-1] if tail else f"ffmpeg exited {returncode}")
+
+        try:
+            produced = out_path.stat().st_size
+        except OSError:
+            produced = 0
+        if not produced:
+            out_path.unlink(missing_ok=True)
+            raise RuntimeError("ffmpeg produced an empty file")
+
+        self.progress.emit(100, "Finishing mix …")
 
 # ─── Signals ─────────────────────────────────────────────────────────────────
 
@@ -1494,15 +2037,11 @@ class PlaylistTrackDownloader(QRunnable):
         tag = "[RIP]"
         started = time.monotonic()
         try:
-            title   = self.song.name
-            artists = self.song.artists or ["Unknown"]
-            # artists can be List[str] (spotdl 4.x)
-            artist  = artists[0] if isinstance(artists[0], str) else str(artists[0])
-
-            safe_title  = sanitize(title)
-            safe_artist = sanitize(artist)
-            stem        = f"{safe_artist} - {safe_title}"
-            filename    = f"{stem}.{self.audio_format}"
+            # Named through the shared helper rather than inline: the mix
+            # builder has to find this exact file again afterwards.
+            artist, title = song_artist_title(self.song)
+            stem          = track_stem(artist, title)
+            filename      = f"{stem}.{self.audio_format}"
             target      = self.output_dir / filename
             tag         = f"[RIP] {stem}:"
 
@@ -1679,9 +2218,7 @@ class TrackRow(QWidget):
         self.checkbox = QCheckBox()
         self.checkbox.setChecked(True)
 
-        title   = song.name
-        artists = song.artists or ["Unknown"]
-        artist  = artists[0] if isinstance(artists[0], str) else str(artists[0])
+        artist, title = song_artist_title(song)
 
         info = QVBoxLayout()
         info.setSpacing(2)
@@ -1786,6 +2323,38 @@ class PreferExplicitSetting(QObject):
 
 
 prefer_explicit_setting = PreferExplicitSetting()
+
+
+class MergeMixSetting(QObject):
+    """
+    Whether a playlist batch also produces one continuous file holding every
+    track back to back. Off by default: it costs an extra full-length encode
+    pass after the batch, and separate files are what most rips are wanted as.
+    """
+    changed = pyqtSignal(bool)
+
+    def __init__(self) -> None:
+        super().__init__()
+        stored = QSettings("RippedRipper", "RipperGUI").value("merge_mix", False)
+        # QSettings round-trips booleans as the strings "true"/"false" on some
+        # backends, so normalise rather than trusting the type.
+        self._value = stored if isinstance(stored, bool) else str(stored).lower() == "true"
+
+    def value(self) -> bool:
+        return self._value
+
+    def set_value(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._value:
+            return
+        self._value = enabled
+        QSettings("RippedRipper", "RipperGUI").setValue("merge_mix", enabled)
+        log(f"[SETTINGS] Merge playlist into one continuous file: "
+            f"{'on' if enabled else 'off'}")
+        self.changed.emit(enabled)
+
+
+merge_mix_setting = MergeMixSetting()
 
 
 class OutputFolderRow(QWidget):
@@ -2040,6 +2609,16 @@ class PlaylistTab(QWidget):
         self._settings = QSettings("RippedRipper", "RipperGUI")
         self._output_dir = Path(self._settings.value("playlist_output_dir", str(PLAYLIST_DIR)))
 
+        # Continuous-mix state, captured when a batch starts so that changing
+        # the format or the output folder mid-batch can't send the merge looking
+        # for files in the wrong place.
+        self._mix_builder:  MixBuilder | None = None
+        self._batch_order:  list[str] = []
+        self._batch_dir:    Path = self._output_dir
+        self._batch_format: str  = audio_format_setting.value()
+        self._mix_ready:    set[str] = set()
+        self._mix_wanted    = False
+
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 24, 24, 20)
         root.setSpacing(14)
@@ -2066,6 +2645,20 @@ class PlaylistTab(QWidget):
         self._folder_row = OutputFolderRow(self._output_dir)
         self._folder_row.changed.connect(self._on_output_dir_changed)
         root.addWidget(self._folder_row)
+
+        # ── One-file mix toggle ─────────────────────────────────────────────
+        self._mix_check = QCheckBox(
+            "Also merge every track into one continuous file"
+        )
+        self._mix_check.setToolTip(
+            "When the batch finishes, join the tracks in playlist order into a "
+            "single file — plus a .cue sheet and a timestamped tracklist — so "
+            "the whole playlist plays through as one unbroken track."
+        )
+        self._mix_check.setChecked(merge_mix_setting.value())
+        self._mix_check.toggled.connect(merge_mix_setting.set_value)
+        merge_mix_setting.changed.connect(self._mix_check.setChecked)
+        root.addWidget(self._mix_check)
 
         # ── Status ──────────────────────────────────────────────────────────
         self._status = QLabel("Paste a Spotify or Apple Music playlist link to fetch and batch-download all tracks")
@@ -2211,8 +2804,17 @@ class PlaylistTab(QWidget):
         out_dir = self._output_dir / sanitize(self._playlist_name or "Playlist")
         out_dir.mkdir(parents=True, exist_ok=True)
 
+        # Read once for the whole batch rather than per worker: the mix has to be
+        # built from the same format every track in it was ripped in.
+        self._batch_order  = [tid for tid, _row in selected]
+        self._batch_dir    = out_dir
+        self._batch_format = audio_format_setting.value()
+        self._mix_ready    = set()
+        self._mix_wanted   = self._mix_check.isChecked()
+
         log(f"[PLAYLIST] Batch start: {self._total} tracks -> {out_dir} "
-            f"({MAX_WORKERS} at a time)")
+            f"({MAX_WORKERS} at a time)"
+            + ("  [+ one-file mix]" if self._mix_wanted else ""))
 
         for tid, row in selected:
             row.set_status("waiting")
@@ -2227,7 +2829,7 @@ class PlaylistTab(QWidget):
             sigs.failed.connect(lambda t, _:  self._on_track_done(t, "failed"))
 
             worker = PlaylistTrackDownloader(
-                song, out_dir, sigs, tid, audio_format_setting.value()
+                song, out_dir, sigs, tid, self._batch_format
             )
             self._pool.start(worker)
 
@@ -2240,6 +2842,10 @@ class PlaylistTab(QWidget):
         row = self._track_rows.get(track_id)
         if row:
             row.set_status(status)
+        # "skipped" means the file was already on disk, so it belongs in the mix
+        # just as much as one downloaded right now; only "failed" has no file.
+        if status in ("done", "skipped"):
+            self._mix_ready.add(track_id)
         self._completed += 1
         self._tally[status] = self._tally.get(status, 0) + 1
         self._progress_bar.setValue(self._completed)
@@ -2253,11 +2859,115 @@ class PlaylistTab(QWidget):
             self._progress_lbl.setText(
                 f"All done - {self._total} tracks processed"
             )
-            self._download_btn.setEnabled(True)
-            self._download_btn.setText("Download Selected")
+            # The merge keeps the button disabled while it runs and re-enables it
+            # from its own finished signal; _start_mix returning False means
+            # there was nothing to merge, so the batch wraps up here instead.
+            if not (self._mix_wanted and self._start_mix()):
+                self._finish_batch()
         else:
             log(f"[PLAYLIST] Progress {self._completed}/{self._total} - {tally}")
             self._progress_lbl.setText(f"{self._completed} / {self._total}")
+
+    # ── Continuous mix ───────────────────────────────────────────────────────
+
+    def _start_mix(self) -> bool:
+        """
+        Merge the batch's tracks into one continuous file.
+
+        Returns False when there is nothing to merge, which leaves the caller to
+        wrap the batch up; True means the MixBuilder owns the progress UI from
+        here until its finished signal arrives.
+        """
+        entries: list[MixEntry] = []
+        for tid in self._batch_order:
+            # Playlist order, not completion order — the tracks finish in
+            # whatever order eight parallel downloads happen to land in, and the
+            # whole point of the mix is that it plays in the order you chose.
+            if tid not in self._mix_ready:
+                continue
+            song = self._songs_map.get(tid)
+            if song is None:
+                continue
+            artist, title = song_artist_title(song)
+            entries.append(MixEntry(
+                path=self._batch_dir / f"{track_stem(artist, title)}.{self._batch_format}",
+                artist=artist,
+                title=title,
+            ))
+
+        if not entries:
+            log("[MIX] no tracks came down successfully - no mix built")
+            self._status.setText("No mix built: none of the tracks downloaded.")
+            return False
+
+        if not FFMPEG_PATH:
+            log("[MIX] ffmpeg not found - cannot build the one-file mix")
+            self._status.setText(
+                "Mix skipped: ffmpeg not found. The individual tracks are saved."
+            )
+            return False
+
+        mix_title = self._playlist_name or "Playlist"
+        mix_path  = (self._batch_dir /
+                     f"{sanitize(mix_title)}{MIX_SUFFIX}.{self._batch_format}")
+
+        self._download_btn.setText("Merging mix...")
+        self._progress_lbl.setText(f"Merging {len(entries)} tracks into one file …")
+
+        builder = MixBuilder(entries, mix_path, mix_title, self._batch_format)
+        builder.progress.connect(self._on_mix_progress)
+        builder.completed.connect(self._on_mix_done)
+        builder.error.connect(self._on_mix_error)
+        builder.finished.connect(self._finish_batch)
+        # Held on the tab, not dropped when the merge ends: a QThread garbage
+        # collected while Qt still holds a reference to it crashes the app.
+        self._mix_builder = builder
+        builder.start()
+        return True
+
+    def _on_mix_progress(self, percent: int, message: str) -> None:
+        if percent < 0:
+            # A zero range is Qt's busy indicator — used while the total length
+            # is still being measured and no real percentage exists yet.
+            self._progress_bar.setRange(0, 0)
+        else:
+            self._progress_bar.setRange(0, 100)
+            self._progress_bar.setValue(percent)
+        self._progress_lbl.setText(message)
+
+    def _on_mix_done(self, mix_file: str, count: int) -> None:
+        path = Path(mix_file)
+        try:
+            size = human_size(path.stat().st_size)
+        except OSError:
+            size = "?"
+        log(f"[MIX] done - {count} tracks -> {path.name} ({size})")
+        self._progress_lbl.setText(f"Mix ready - {count} tracks in one file")
+        self._status.setText(f"One-file mix saved:  {path.name}  ·  {size}")
+
+    def _on_mix_error(self, msg: str) -> None:
+        self._progress_lbl.setText("Mix failed - the individual tracks are still saved")
+        self._status.setText(f"Mix failed: {msg}")
+
+    def _finish_batch(self) -> None:
+        """Hand the controls back to the user, after the batch and any merge."""
+        self._progress_bar.setRange(0, 1)
+        self._progress_bar.setValue(1)
+        self._download_btn.setEnabled(True)
+        self._download_btn.setText("Download Selected")
+
+    def shutdown(self) -> None:
+        """
+        Stop a merge in progress before the app exits.
+
+        ffmpeg is an external process writing a full-length file: left alone it
+        outlives the window and keeps grinding out a mix nobody is waiting for.
+        """
+        builder = self._mix_builder
+        if builder is not None and builder.isRunning():
+            log("[MIX] cancelling the merge - app is closing")
+            builder.cancel()
+            builder.wait(5000)
 
     def _open_folder(self) -> None:
         folder = (
@@ -2442,6 +3152,21 @@ class SettingsTab(QWidget):
         explicit_row.addStretch()
         section.addLayout(explicit_row)
 
+        mix_row = QHBoxLayout()
+        mix_row.addWidget(self._row_label("Continuous mix"))
+        self._mix_check = QCheckBox("Merge a playlist into one unbroken file")
+        self._mix_check.setChecked(merge_mix_setting.value())
+        self._mix_check.setToolTip(
+            "Default for the Playlist Ripper's merge toggle: after a batch, "
+            "join its tracks in order into one continuous file, with a .cue "
+            "sheet and tracklist beside it."
+        )
+        self._mix_check.toggled.connect(merge_mix_setting.set_value)
+        merge_mix_setting.changed.connect(self._mix_check.setChecked)
+        mix_row.addWidget(self._mix_check)
+        mix_row.addStretch()
+        section.addLayout(mix_row)
+
         return section
 
     def _on_workers_changed(self, value: int) -> None:
@@ -2559,9 +3284,10 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         # "&&" escapes the ampersand — a single "&" is read as a mnemonic marker
         # and renders as a stray underline in the tab label.
-        tabs.addTab(SearchTab(pool),   "Search && Rip")
-        tabs.addTab(PlaylistTab(pool), "Playlist Ripper")
-        tabs.addTab(SettingsTab(),     "Settings")
+        self._playlist_tab = PlaylistTab(pool)
+        tabs.addTab(SearchTab(pool),    "Search && Rip")
+        tabs.addTab(self._playlist_tab, "Playlist Ripper")
+        tabs.addTab(SettingsTab(),      "Settings")
         splitter.addWidget(tabs)
 
         # ── Console ──────────────────────────────────────────────────────────
@@ -2591,6 +3317,11 @@ class MainWindow(QMainWindow):
         for checker in self._update_checkers:
             checker.start()
 
+    def closeEvent(self, event) -> None:
+        """Stop the external ffmpeg merge before the window goes away."""
+        self._playlist_tab.shutdown()
+        super().closeEvent(event)
+
     def _append_log(self, msg: str) -> None:
         self.console.append(msg)
         # Scroll to bottom
@@ -2614,6 +3345,7 @@ def selftest() -> int:
     print(f"bundle dir    : {BUNDLE_DIR}")
     print(f"output base   : {BASE_DIR}")
     print(f"ffmpeg        : {FFMPEG_PATH or 'NOT FOUND'}")
+    print(f"ffprobe       : {FFPROBE_PATH or 'NOT FOUND'}")
 
     if not FFMPEG_PATH:
         print("FAIL: no ffmpeg available; audio conversion would fail.")
@@ -2631,13 +3363,60 @@ def selftest() -> int:
     ).run()
 
     files = list(out.iterdir())
-    if result.get("status") == "ok" and files:
-        print(f"rip           : OK -> {files[0].name} "
-              f"({files[0].stat().st_size // 1024} KB)")
-        return 0
+    if result.get("status") != "ok" or not files:
+        print(f"rip           : FAILED ({result})")
+        return 1
 
-    print(f"rip           : FAILED ({result})")
-    return 1
+    print(f"rip           : OK -> {files[0].name} "
+          f"({files[0].stat().st_size // 1024} KB)")
+
+    return selftest_mix(files[0], out)
+
+
+def selftest_mix(source: Path, out: Path) -> int:
+    """
+    Merge the just-ripped track into a two-entry continuous mix and check the
+    result really is twice as long.
+
+    Worth its own check in CI because the merge is the one thing that shells out
+    to ffmpeg *and* ffprobe directly — a bundle that rips fine can still ship a
+    broken concat if only ffmpeg got staged, and a file-existence check in the
+    build script wouldn't notice.
+    """
+    entries = [
+        MixEntry(path=source, artist="The Strokes", title="Last Nite"),
+        MixEntry(path=source, artist="The Strokes", title="Last Nite (again)"),
+    ]
+    mix_path = out / f"Selftest{MIX_SUFFIX}.mp3"
+
+    outcome: dict[str, object] = {}
+    builder = MixBuilder(entries, mix_path, "Selftest Mix", "mp3")
+    builder.completed.connect(lambda path, n: outcome.update(path=path, tracks=n))
+    builder.error.connect(lambda msg: outcome.update(error=msg))
+    builder.run()          # synchronous: no event loop to run the thread under
+
+    if "error" in outcome or not mix_path.exists():
+        print(f"mix           : FAILED ({outcome})")
+        return 1
+
+    one  = probe_duration(source)
+    both = probe_duration(mix_path)
+    size = mix_path.stat().st_size // 1024
+    if one and both:
+        if not (1.8 * one <= both <= 2.2 * one):
+            print(f"mix           : FAILED - {both:.1f}s is not two "
+                  f"copies of a {one:.1f}s track")
+            return 1
+        print(f"mix           : OK -> {mix_path.name} ({size} KB, {both:.1f}s)")
+    else:
+        # No ffprobe: the merge still ran, the length just can't be confirmed.
+        print(f"mix           : OK -> {mix_path.name} ({size} KB, length unverified)")
+
+    for sidecar in (mix_path.with_suffix(".cue"), mix_path.with_suffix(".txt")):
+        print(f"{sidecar.suffix[1:]:<14}: "
+              f"{'OK' if sidecar.exists() else 'not written (no ffprobe)'}")
+
+    return 0
 
 
 def main() -> None:

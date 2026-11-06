@@ -1,4 +1,6 @@
-fastapi
+# The template calls use the request-first TemplateResponse signature,
+# which needs Starlette 0.29+ (FastAPI 0.106+).
+fastapi>=0.106
 uvicorn
 ytmusicapi
 yt-dlp

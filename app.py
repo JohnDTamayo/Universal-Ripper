@@ -132,14 +132,16 @@ def download_song(query: str, download_dir: str, request_id: int = None):
 
 @app.get("/", response_class=HTMLResponse)
 async def guest_view(request: Request):
-    # Positional (name, context) form: spotdl pins fastapi<0.104, which pulls
-    # starlette 0.27 where the newer TemplateResponse(request=...) keyword form
-    # doesn't exist. This form works on both old and new Starlette.
-    return templates.TemplateResponse("guest.html", {"request": request})
+    # Request first. The old (name, context) argument order was deprecated in
+    # Starlette 0.29 and removed in 1.0 — against the version actually
+    # installed it raised "cannot use 'tuple' as a dict key" from deep inside
+    # Jinja's template cache and served a 500 for every page. The pin that form
+    # was kept for (spotdl holding fastapi below 0.104) is long gone.
+    return templates.TemplateResponse(request, "guest.html")
 
 @app.get("/dj", response_class=HTMLResponse)
 async def dj_dashboard(request: Request):
-    return templates.TemplateResponse("dj.html", {"request": request})
+    return templates.TemplateResponse(request, "dj.html")
 
 @app.post("/api/request")
 async def submit_request(artist: str = Form(...), song: str = Form(...)):

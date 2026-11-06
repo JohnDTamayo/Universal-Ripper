@@ -1,6 +1,6 @@
 # Ripped Ripper
 
-Automated music request and ripping toolkit for live DJ sets. Guests submit song requests through a web portal; the DJ searches, rips, and manages tracks in real time. Includes a standalone desktop app for search-based ripping and full Spotify/Apple Music playlist downloads.
+Automated music request and ripping toolkit for live DJ sets. Guests submit song requests through a web portal; the DJ searches, rips, and manages tracks in real time. Includes a standalone desktop app for search-based ripping and full Spotify/Apple Music playlist downloads — as separate tracks, as one continuous mix file, or both.
 
 ## Features
 
@@ -8,6 +8,7 @@ Automated music request and ripping toolkit for live DJ sets. Guests submit song
 - **DJ Dashboard** — web console for the DJ to process requests in real time
 - **Desktop GUI** — native PyQt6 app for search-and-rip or playlist batch downloads
 - **Playlist Ripping** — paste a Spotify or Apple Music playlist link to fetch and rip every track
+- **One-File Continuous Mix** — optionally join the whole playlist into a single gapless track, with a `.cue` sheet and timestamped tracklist beside it
 - **Universal Search** — real-time YouTube Music search for any track
 - **Choose Your Format** — rip to MP3, M4A, FLAC or WAV; all four load in Traktor, Serato, Rekordbox and VirtualDJ
 - **Parallel Ripping** — up to 8 tracks at once, with retry/backoff when YouTube throttles
@@ -63,6 +64,26 @@ Share the generated Ngrok URL with your guests.
 **Launch afterward**:
 - macOS: `launch_gui.command`, or the **Ripped Ripper** app on your Desktop
 - Windows: `launch_gui.bat`, or the **Ripped Ripper** shortcut on your Desktop
+
+### Continuous mix (one file for a whole playlist)
+
+Tick **"Also merge every track into one continuous file"** on the Playlist Ripper tab (or set the default under *Settings → Continuous mix*). When the batch finishes, the tracks are joined in playlist order into a single file you can play start to finish without ever cueing the next track:
+
+```
+Playlist_Rips/My Set/
+├── Artist - Track One.mp3          ← the individual rips, as usual
+├── Artist - Track Two.mp3
+├── ...
+├── My Set (Full Mix).mp3           ← every track, back to back
+├── My Set (Full Mix).cue           ← track markers for DJ software
+└── My Set (Full Mix).txt           ← timestamped tracklist
+```
+
+- The per-track files are kept, so the mix is an addition rather than a replacement — and it can be rebuilt (or rebuilt in another format) later without re-downloading.
+- Tracks already on disk are reused, so re-running a batch just rebuilds the mix.
+- A track that fails to download is left out and the rest are merged around it.
+- The `.cue` sheet gives Traktor, Rekordbox, Serato and VirtualDJ real track markers to skip between; the `.txt` is the timestamped list to paste into a Mixcloud or SoundCloud description.
+- Mixes are re-encoded to 44.1 kHz stereo in your chosen format, so a playlist with mismatched sources still plays as one continuous stream. Note that WAV itself tops out just under 4 GB (~6.7 hours) — FLAC or MP3 for anything longer.
 
 **Output format** — pick one from the `Format` dropdown; the choice is remembered and applies to both tabs.
 
